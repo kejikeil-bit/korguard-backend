@@ -104,3 +104,4 @@ Deploy to `https://api.korguard.app` (or update the endpoint in `src/backendClie
 The backend uses CORS middleware to allow requests from Chrome extensions.
 
 # korguard-backend
+# korguard-backend
