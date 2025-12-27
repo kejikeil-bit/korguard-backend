@@ -105,3 +105,4 @@ The backend uses CORS middleware to allow requests from Chrome extensions.
 
 # korguard-backend
 # korguard-backend
+# korguard-backend
