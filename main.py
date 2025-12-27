@@ -43,29 +43,31 @@ async def health():
 # ---- Main evaluate endpoint ----
 @app.post("/evaluate", response_model=EvaluateResponse)
 async def evaluate(req: EvaluateRequest):
- """
-Called by the KorGuard extension.
-For medical vertical: use MedicalEvaluator.
-For other verticals: return green for now (local logic can handle them).
-"""
-if req.vertical.lower() in ["medical", "healthcare"]:
-    result = evaluator.evaluate_text(req.text, req.sensitivityLevel)
+    """
+    Called by the KorGuard extension.
+    For medical vertical: use MedicalEvaluator.
+    For other verticals: return green for now (local logic can handle them).
+    """
+
+    if req.vertical.lower() in ["medical", "healthcare"]:
+        result = evaluator.evaluate_text(req.text, req.sensitivityLevel)
+        return EvaluateResponse(
+            severity=result.severity,
+            matchedCategories=result.matched_categories,
+            matchedKeywords=result.matched_keywords,
+            counts=result.counts,
+            explanations=result.explanations,
+        )
+
+    # Non-medical verticals – keep simple
     return EvaluateResponse(
-        severity=result.severity,
-        matchedCategories=result.matched_categories,
-        matchedKeywords=result.matched_keywords,
-        counts=result.counts,
-        explanations=result.explanations,
+        severity="green",
+        matchedCategories=[],
+        matchedKeywords=[],
+        counts={"high": 0, "medium": 0},
+        explanations=["Non-medical vertical – defaulting to green from backend."],
     )
 
-# Non-medical verticals – keep simple, frontend can still use local scanner
-return EvaluateResponse(
-    severity="green",
-    matchedCategories=[],
-    matchedKeywords=[],
-    counts={"high": 0, "medium": 0},
-    explanations=["Non-medical vertical – defaulting to green from backend."],
-)
 
 
 
