@@ -609,10 +609,6 @@ class HIPAARulesEngine:
             })
         
         return violations
-            # At high sensitivity, any violation is at least orange
-            if self.sensitivity >= 3:
-                return 'orange'
-            return 'green'
 
 
 # Initialize rules engine instance
