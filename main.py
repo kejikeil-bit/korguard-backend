@@ -46,6 +46,8 @@ class ScanResult(BaseModel):
     status: str  # green, orange, red
     violations: List[Dict[str, Any]]
     scan_time: float
+    scores: Optional[Dict[str, int]] = None
+    reasons: Optional[List[Dict[str, Any]]] = None
 
 class SubmitEventRequest(BaseModel):
     status: str
@@ -112,406 +114,501 @@ ADMIN_CREDENTIALS = {
 }
 
 # ============================================================================
-# HIPAA RULES ENGINE
+# HIPAA PRIVACY RULE ENGINE v2
+# Precisely HIPAA-driven detection focused on PHI disclosure
+# Reference: HHS Privacy Rule Summary - 45 CFR § 164.514
 # ============================================================================
 
 class HIPAARulesEngine:
     """
-    HIPAA compliance detection engine covering all 5 titles with focus on
-    Title II Privacy Rule and the 18 PHI identifiers.
+    HIPAA Privacy Rule compliance detection engine v2.
+    
+    Key principles:
+    - PHI = Health/treatment/payment info + Identifier that can identify an individual
+    - First-person pronouns (I/me/my/we/us) NEVER trigger warnings alone
+    - RED is reserved for HIGH-CONFIDENCE PHI disclosure
+    - De-identified or generalized information is GREEN
     """
     
-    # 18 HIPAA PHI Identifiers
-    PHI_PATTERNS = {
-        'name': {
+    # ========================================================================
+    # STAGE A: FEATURE DEFINITIONS
+    # ========================================================================
+    
+    # Strong identifiers (HIPAA Safe Harbor list) - Score 2
+    STRONG_IDENTIFIERS = {
+        'full_name': {
             'patterns': [
-                # Names with titles
-                r'\b(?:Mr\.|Mrs\.|Ms\.|Dr\.|Prof\.)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?',
-                # Two capitalized words (potential name)
-                r'\b[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}\b',
-                # Named as patient
-                r'(?:patient|client|member)\s*(?:named?|:)?\s*[A-Z][a-z]+',
+                # Full names with titles
+                r'\b(?:Mr\.|Mrs\.|Ms\.|Dr\.|Prof\.)\s+[A-Z][a-z]+\s+[A-Z][a-z]+\b',
+                # Two capitalized words that look like first + last name
+                r'\b[A-Z][a-z]{2,15}\s+[A-Z][a-z]{2,15}\b',
+                # Patient named X
+                r'(?:patient|client|member)\s+(?:named?|is|:)\s*[A-Z][a-z]+\s+[A-Z][a-z]+',
             ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(A)',
-            'description': 'Names - Personal identifiers',
-            'weight': 3
+            'description': 'Full name (first + last)',
+            'score': 2
         },
-        'geographic': {
+        'ssn': {
             'patterns': [
-                # Street addresses
-                r'\b\d{1,5}\s+(?:[A-Z][a-z]+\s+){1,3}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way|Place|Pl)\b',
-                # ZIP codes
-                r'\b\d{5}(?:-\d{4})?\b',
-                # City, State format
-                r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?,\s*[A-Z]{2}\b',
+                r'\b\d{3}-\d{2}-\d{4}\b',
+                r'\b(?:SSN|Social\s*Security(?:\s*Number)?)[:\s#]*\d{3}[-\s]?\d{2}[-\s]?\d{4}\b',
             ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(B)',
-            'description': 'Geographic data smaller than a state',
-            'weight': 2
+            'description': 'Social Security Number',
+            'score': 3  # Highest - always RED with health context
         },
-        'dates': {
+        'mrn': {
             'patterns': [
-                # Full dates MM/DD/YYYY or similar
-                r'\b(?:0?[1-9]|1[0-2])[/\-](?:0?[1-9]|[12]\d|3[01])[/\-](?:19|20)\d{2}\b',
-                # Written dates
+                r'\b(?:MRN|Medical\s*Record(?:\s*Number)?|Chart\s*(?:Number|#|ID))[:\s#]+[A-Z0-9\-]+\b',
+                r'\bMRN\s*[:\s#]?\s*[A-Z0-9]{4,}\b',
+            ],
+            'description': 'Medical Record Number',
+            'score': 2
+        },
+        'full_address': {
+            'patterns': [
+                # Street address with number
+                r'\b\d{1,5}\s+(?:[A-Z][a-z]+\s+){1,3}(?:Street|St\.?|Avenue|Ave\.?|Road|Rd\.?|Boulevard|Blvd\.?|Lane|Ln\.?|Drive|Dr\.?|Court|Ct\.?|Way|Place|Pl\.?|Circle|Cir\.?)\b(?:[,\s]+(?:Apt\.?|Suite|Ste\.?|Unit|#)\s*\d+)?',
+            ],
+            'description': 'Street address',
+            'score': 2
+        },
+        'full_dob': {
+            'patterns': [
+                # Explicit DOB mention
+                r'\b(?:DOB|date\s*of\s*birth|born(?:\s*on)?)[:\s]+(?:\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\w+\s+\d{1,2},?\s+\d{4})\b',
+                # Full date with month name
                 r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b',
-                # Birth date context
-                r'\b(?:born|DOB|date of birth|birthday)[:\s]+\S+',
-                # Age over 89
-                r'\b(?:age[d]?\s*[:=]?\s*)?(?:9[0-9]|1\d{2})\s*(?:years?|y\.?o\.?|year[s]?\s*old)\b',
             ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(C)',
-            'description': 'Dates (except year) related to an individual',
-            'weight': 2
-        },
-        'phone': {
-            'patterns': [
-                # Phone numbers in various formats
-                r'\b(?:\+?1[-.\s]?)?\(?[2-9]\d{2}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b',
-                r'\b(?:phone|tel|cell|mobile)[:\s]+[\d\-\(\)\s]+\b',
-            ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(D)',
-            'description': 'Telephone numbers',
-            'weight': 3
-        },
-        'fax': {
-            'patterns': [
-                r'\b(?:fax)[:\s]+[\d\-\(\)\s]+\b',
-            ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(E)',
-            'description': 'Fax numbers',
-            'weight': 2
+            'description': 'Date of birth or full date',
+            'score': 2
         },
         'email': {
             'patterns': [
                 r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
             ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(F)',
-            'description': 'Email addresses',
-            'weight': 3
+            'description': 'Email address',
+            'score': 2
         },
-        'ssn': {
+        'phone': {
             'patterns': [
-                # SSN formats
-                r'\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b',
-                r'\b(?:SSN|Social Security)[:\s#]+\d+',
+                r'\b(?:\+?1[-.\s]?)?\(?[2-9]\d{2}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b',
             ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(G)',
-            'description': 'Social Security numbers',
-            'weight': 5
+            'description': 'Phone number',
+            'score': 2
         },
-        'mrn': {
-            'patterns': [
-                r'\b(?:MRN|Medical Record|Patient ID|Chart)[:\s#]+[A-Z0-9]+',
-                r'\b(?:record\s*(?:number|#|no\.?))[:\s]+[A-Z0-9]+',
-            ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(H)',
-            'description': 'Medical record numbers',
-            'weight': 4
-        },
-        'health_plan': {
-            'patterns': [
-                r'\b(?:policy|member|subscriber|group|plan)[:\s#]+[A-Z0-9\-]+',
-                r'\b(?:insurance|health plan|HMO|PPO)[:\s]+\S+',
-            ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(I)',
-            'description': 'Health plan beneficiary numbers',
-            'weight': 3
-        },
-        'account': {
-            'patterns': [
-                r'\b(?:account|acct)[:\s#]+[A-Z0-9\-]+',
-                r'\b(?:bank|credit card|debit)[:\s]+[\d\-\s]+',
-            ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(J)',
-            'description': 'Account numbers',
-            'weight': 3
-        },
-        'license': {
-            'patterns': [
-                r'\b(?:license|certificate|DEA)[:\s#]+[A-Z0-9\-]+',
-                r'\b(?:driver\'?s?\s*license|DL)[:\s#]+[A-Z0-9]+',
-            ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(K)',
-            'description': 'Certificate/license numbers',
-            'weight': 3
-        },
-        'vehicle': {
-            'patterns': [
-                r'\b(?:VIN|vehicle|license plate)[:\s#]+[A-Z0-9]+',
-                r'\b[A-Z]{3}[-\s]?\d{4}\b',  # Common license plate format
-            ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(L)',
-            'description': 'Vehicle identifiers and license plate numbers',
-            'weight': 2
-        },
-        'device': {
-            'patterns': [
-                r'\b(?:device|serial|IMEI|MAC)[:\s#]+[A-Z0-9\-:]+',
-                r'\b(?:pacemaker|implant|device)\s+(?:ID|serial|number)[:\s]+\S+',
-            ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(M)',
-            'description': 'Device identifiers and serial numbers',
-            'weight': 3
-        },
-        'url': {
-            'patterns': [
-                r'\bhttps?://[^\s<>"{}|\\^`\[\]]+',
-                r'\bwww\.[^\s<>"{}|\\^`\[\]]+',
-            ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(N)',
-            'description': 'Web URLs',
-            'weight': 1
-        },
-        'ip_address': {
-            'patterns': [
-                r'\b(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b',
-                r'\b(?:IP|IP address)[:\s]+\S+',
-            ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(O)',
-            'description': 'IP addresses',
-            'weight': 2
-        },
-        'biometric': {
-            'patterns': [
-                r'\b(?:fingerprint|voiceprint|retina|iris|DNA|biometric)[:\s]+\S+',
-            ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(P)',
-            'description': 'Biometric identifiers',
-            'weight': 4
-        },
-        'photo': {
-            'patterns': [
-                r'\b(?:photo|photograph|image|picture)\s+(?:of|showing)\s+(?:patient|face|person)',
-                r'\b(?:full[- ]?face|facial)\s+(?:photo|image)',
-            ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(Q)',
-            'description': 'Full-face photographs and comparable images',
-            'weight': 3
-        },
-        'unique_id': {
-            'patterns': [
-                r'\b(?:unique|patient|person)\s+(?:identifier|ID|code)[:\s]+\S+',
-            ],
-            'title': 'Title II',
-            'subsection': '45 CFR § 164.514(b)(2)(i)(R)',
-            'description': 'Any other unique identifying number or code',
-            'weight': 2
-        }
     }
     
-    # Health-related keywords (presence with identifiers = higher risk)
-    HEALTH_KEYWORDS = [
-        'patient', 'diagnosis', 'diagnosed', 'treatment', 'medication', 'prescription',
-        'condition', 'symptom', 'disease', 'disorder', 'syndrome', 'illness',
-        'hospital', 'clinic', 'doctor', 'physician', 'nurse', 'medical',
-        'surgery', 'procedure', 'therapy', 'prognosis', 'chronic', 'acute',
-        'diabetes', 'cancer', 'HIV', 'AIDS', 'hepatitis', 'tuberculosis',
-        'mental health', 'psychiatric', 'depression', 'anxiety', 'bipolar',
-        'blood pressure', 'cholesterol', 'BMI', 'weight', 'height',
-        'allergies', 'allergy', 'immunization', 'vaccine', 'lab results',
-        'radiology', 'X-ray', 'MRI', 'CT scan', 'ultrasound',
-        'insurance claim', 'covered', 'pre-existing', 'health record',
-        'PHI', 'protected health information', 'HIPAA'
+    # Weak/partial identifiers - Score 1
+    WEAK_IDENTIFIERS = {
+        'first_name_only': {
+            'patterns': [
+                # Single capitalized word in patient context (but not common words)
+                r'\b(?:patient|client)\s+(?:named?|is|:)\s*([A-Z][a-z]{2,})\b',
+                # Mr/Mrs with single name
+                r'\b(?:Mr\.|Mrs\.|Ms\.)\s+([A-Z][a-z]+)\b',
+            ],
+            'description': 'First name only',
+            'score': 1
+        },
+        'city_only': {
+            'patterns': [
+                r'\b(?:in|from|at|lives?\s*in)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?),?\s+(?:[A-Z]{2}|[A-Za-z]+)\b',
+            ],
+            'description': 'City/location only',
+            'score': 1
+        },
+        'age_specific': {
+            'patterns': [
+                # Age over 89 (HIPAA identifier)
+                r'\b(?:age[d]?\s*[:=]?\s*)?(9[0-9]|1[0-4]\d)\s*(?:years?|y\.?o\.?|year[s]?\s*old)\b',
+            ],
+            'description': 'Age over 89',
+            'score': 1
+        },
+        'zip_code': {
+            'patterns': [
+                r'\b\d{5}(?:-\d{4})?\b',
+            ],
+            'description': 'ZIP code',
+            'score': 1
+        },
+        'initial_or_abbrev': {
+            'patterns': [
+                # Mr. K, Mrs. J, etc.
+                r'\b(?:Mr\.|Mrs\.|Ms\.|Dr\.)\s+[A-Z]\.?\b',
+            ],
+            'description': 'Name initial only',
+            'score': 1
+        },
+    }
+    
+    # Health context keywords - determines health_score
+    HEALTH_CONTEXT = {
+        'explicit_diagnosis': {
+            'patterns': [
+                # Specific diagnoses
+                r'\b(?:diagnosed\s+with|diagnosis(?:\s+of)?[:\s]+|has\s+(?:been\s+)?diagnosed)\s+\w+',
+                r'\b(?:cancer|diabetes|HIV|AIDS|hepatitis|tuberculosis|TB|COPD|CHF|CAD|CKD|ESRD|cirrhosis|lupus|MS|multiple\s+sclerosis|parkinson|alzheimer|dementia|schizophrenia|bipolar|major\s+depression|anxiety\s+disorder|PTSD|autism|epilepsy|seizure\s+disorder)\b',
+                r'\b(?:stage\s+(?:I{1,4}|[1-4])|terminal|metastatic|malignant|benign)\s+\w+',
+            ],
+            'description': 'Explicit diagnosis',
+            'score': 2
+        },
+        'treatment_procedure': {
+            'patterns': [
+                r'\b(?:surgery|chemotherapy|chemo|radiation|dialysis|transplant|amputation|intubat|ventilat|transfusion|infusion|biopsy)\b',
+                r'\b(?:admitted|discharged|hospitalized|inpatient|outpatient|ER\s+visit|emergency\s+room)\b',
+            ],
+            'description': 'Treatment or procedure',
+            'score': 2
+        },
+        'medications': {
+            'patterns': [
+                r'\b(?:taking|prescribed|on|started|discontinued)\s+(?:medication|meds?|drug)s?\b',
+                r'\b(?:warfarin|metformin|insulin|lisinopril|atorvastatin|metoprolol|omeprazole|amlodipine|gabapentin|hydrocodone|oxycodone|morphine|fentanyl)\b',
+            ],
+            'description': 'Medication reference',
+            'score': 2
+        },
+        'lab_imaging': {
+            'patterns': [
+                r'\b(?:CBC|BMP|CMP|A1C|HbA1c|PSA|TSH|lipid\s+panel|liver\s+function|kidney\s+function)\b',
+                r'\b(?:CT\s+scan|MRI|X-ray|ultrasound|mammogram|colonoscopy|endoscopy|EKG|ECG|echocardiogram)\b',
+            ],
+            'description': 'Lab or imaging results',
+            'score': 2
+        },
+        'patient_context': {
+            'patterns': [
+                r'\b(?:my\s+patient|the\s+patient|this\s+patient|patient\'s|patient\s+with)\b',
+                r'\b(?:chart|medical\s+record|clinical\s+note|progress\s+note|H&P|history\s+and\s+physical|discharge\s+summary)\b',
+                r'\b(?:chief\s+complaint|presenting\s+with|presents\s+with|complaining\s+of)\b',
+            ],
+            'description': 'Patient/clinical context',
+            'score': 1
+        },
+        'general_health': {
+            'patterns': [
+                r'\b(?:symptoms?|condition|illness|disease|disorder|syndrome|treatment|therapy|prognosis)\b',
+                r'\b(?:hospital|clinic|physician|doctor|nurse|provider|specialist)\b',
+            ],
+            'description': 'General health terms',
+            'score': 1
+        },
+    }
+    
+    # First-person exemption patterns - these NEVER trigger warnings alone
+    FIRST_PERSON_PATTERNS = [
+        r'\b(?:I|I\'m|I\'ve|I\'ll|I\'d|me|my|myself|mine|we|we\'re|we\'ve|we\'ll|us|our|ours|ourselves)\b',
     ]
     
-    # Title I-V specific triggers
-    TITLE_TRIGGERS = {
-        'Title I': {
-            'patterns': [
-                r'\b(?:pre-?existing\s+condition|deny\s+coverage|insurance\s+portability)',
-                r'\b(?:COBRA|continuation\s+coverage|group\s+health\s+plan)',
-                r'\b(?:exclusion\s+period|creditable\s+coverage)',
-            ],
-            'description': 'Health Insurance Portability concerns'
-        },
-        'Title III': {
-            'patterns': [
-                r'\b(?:medical\s+savings\s+account|MSA|tax\s+deduction)',
-                r'\b(?:HIPAA\s+tax|penalty|IRS)',
-            ],
-            'description': 'Tax-related HIPAA provisions'
-        },
-        'Title IV': {
-            'patterns': [
-                r'\b(?:group\s+health\s+plan\s+requirement|dependent\s+coverage)',
-                r'\b(?:ERISA|employee\s+benefit)',
-            ],
-            'description': 'Group Health Plan requirements'
-        },
-        'Title V': {
-            'patterns': [
-                r'\b(?:revenue\s+offset|company-?owned\s+life\s+insurance|COLI)',
-            ],
-            'description': 'Revenue Offset provisions'
-        }
-    }
-    
-    # Security Rule triggers (Title II)
-    SECURITY_TRIGGERS = [
-        r'\b(?:password|credential|login|authentication)\s*(?:is|=|:)\s*\S+',
-        r'\b(?:unencrypted|no\s+encryption|plain\s*text)',
-        r'\b(?:shared\s+password|password\s+sharing)',
-        r'\b(?:remote\s+access|VPN\s+credentials)',
+    # De-identification patterns (safe generalizations)
+    DEIDENTIFIED_PATTERNS = [
+        r'\b(?:a|an|the)\s+(?:\d{1,2}[-\s]?year[-\s]?old|elderly|middle[-\s]?aged|young|teenage|adolescent|pediatric|geriatric)\s+(?:male|female|man|woman|patient|person|individual)\b',
+        r'\b(?:patients?\s+with|people\s+with|individuals?\s+with|those\s+with|someone\s+with)\s+\w+\b',
+        r'\b(?:in\s+(?:his|her|their)\s+(?:\d0s|forties|fifties|sixties|seventies|eighties))\b',
     ]
     
     def __init__(self, sensitivity: int = 3):
         """
         Initialize the rules engine with a sensitivity level (1-4).
-        1 = Low (strict, fewer false positives)
-        4 = High (aggressive, more false positives)
+        1 = Low (very strict, RED only for obvious PHI)
+        2 = Medium (balanced)
+        3 = Recommended (default)
+        4 = High (more cautious)
         """
         self.sensitivity = min(max(sensitivity, 1), 4)
         self._compile_patterns()
     
     def _compile_patterns(self):
         """Pre-compile regex patterns for performance."""
-        self.compiled_phi = {}
-        for identifier, config in self.PHI_PATTERNS.items():
-            self.compiled_phi[identifier] = {
+        # Compile strong identifiers
+        self.compiled_strong = {}
+        for name, config in self.STRONG_IDENTIFIERS.items():
+            self.compiled_strong[name] = {
                 **config,
                 'compiled': [re.compile(p, re.IGNORECASE) for p in config['patterns']]
             }
         
-        self.compiled_titles = {}
-        for title, config in self.TITLE_TRIGGERS.items():
-            self.compiled_titles[title] = {
+        # Compile weak identifiers
+        self.compiled_weak = {}
+        for name, config in self.WEAK_IDENTIFIERS.items():
+            self.compiled_weak[name] = {
                 **config,
                 'compiled': [re.compile(p, re.IGNORECASE) for p in config['patterns']]
             }
         
-        self.compiled_security = [re.compile(p, re.IGNORECASE) for p in self.SECURITY_TRIGGERS]
+        # Compile health context
+        self.compiled_health = {}
+        for name, config in self.HEALTH_CONTEXT.items():
+            self.compiled_health[name] = {
+                **config,
+                'compiled': [re.compile(p, re.IGNORECASE) for p in config['patterns']]
+            }
         
-        self.health_pattern = re.compile(
-            r'\b(?:' + '|'.join(re.escape(kw) for kw in self.HEALTH_KEYWORDS) + r')\b',
-            re.IGNORECASE
-        )
+        # Compile first-person patterns
+        self.compiled_first_person = [
+            re.compile(p, re.IGNORECASE) for p in self.FIRST_PERSON_PATTERNS
+        ]
+        
+        # Compile de-identification patterns
+        self.compiled_deidentified = [
+            re.compile(p, re.IGNORECASE) for p in self.DEIDENTIFIED_PATTERNS
+        ]
     
     def scan(self, text: str) -> Dict:
         """
-        Scan text for HIPAA violations.
-        Returns status (green/orange/red) and list of violations found.
+        Scan text for HIPAA Privacy Rule PHI disclosure.
+        
+        Returns:
+            {
+                "status": "green" | "orange" | "red",
+                "reasons": [...],
+                "scores": {"health_score": int, "identifier_score": int},
+                "scan_time": float
+            }
         """
         import time
         start_time = time.time()
         
-        violations = []
-        total_weight = 0
-        has_health_context = bool(self.health_pattern.search(text))
+        # Stage A: Feature extraction
+        reasons = []
+        health_reasons = []
+        identifier_reasons = []
         
-        # Check PHI identifiers
-        for identifier, config in self.compiled_phi.items():
+        # Check if text is primarily first-person (about the author, not a patient)
+        is_first_person = self._is_first_person_context(text)
+        
+        # Check if text uses de-identified/generalized language
+        is_deidentified = self._is_deidentified(text)
+        
+        # Extract health context features
+        health_score = 0
+        for name, config in self.compiled_health.items():
             for pattern in config['compiled']:
                 matches = pattern.findall(text)
                 if matches:
-                    # Unique matches only
-                    unique_matches = list(set(matches[:5]))  # Limit to 5 examples
-                    weight = config['weight']
-                    
-                    # Increase weight if health context is present
-                    if has_health_context:
-                        weight *= 1.5
-                    
-                    violations.append({
-                        'type': identifier,
-                        'title': config['title'],
-                        'subsection': config['subsection'],
-                        'description': config['description'],
-                        'keywords': unique_matches,
-                        'weight': weight
-                    })
-                    total_weight += weight * len(unique_matches)
+                    unique_matches = list(set(m if isinstance(m, str) else m[0] for m in matches[:3]))
+                    if unique_matches:
+                        health_reasons.append({
+                            'type': 'health',
+                            'subtype': name,
+                            'description': config['description'],
+                            'snippets': unique_matches,
+                            'score': config['score']
+                        })
+                        health_score = max(health_score, config['score'])
         
-        # Check other HIPAA titles
-        for title, config in self.compiled_titles.items():
+        # Extract identifier features
+        identifier_score = 0
+        strong_id_count = 0
+        weak_id_count = 0
+        
+        # Check strong identifiers
+        for name, config in self.compiled_strong.items():
             for pattern in config['compiled']:
                 matches = pattern.findall(text)
                 if matches:
-                    unique_matches = list(set(matches[:3]))
-                    violations.append({
-                        'type': f'{title.lower().replace(" ", "_")}_trigger',
-                        'title': title,
-                        'subsection': 'N/A',
-                        'description': config['description'],
-                        'keywords': unique_matches,
-                        'weight': 2
-                    })
-                    total_weight += 2 * len(unique_matches)
+                    unique_matches = list(set(m if isinstance(m, str) else m[0] for m in matches[:3]))
+                    # Filter out common false positives
+                    unique_matches = self._filter_false_positives(unique_matches, name)
+                    if unique_matches:
+                        identifier_reasons.append({
+                            'type': 'identifier',
+                            'subtype': name,
+                            'description': config['description'],
+                            'snippets': unique_matches,
+                            'score': config['score']
+                        })
+                        identifier_score = max(identifier_score, config['score'])
+                        strong_id_count += 1
         
-        # Check Security Rule triggers
-        for pattern in self.compiled_security:
-            matches = pattern.findall(text)
-            if matches:
-                unique_matches = list(set(matches[:3]))
-                violations.append({
-                    'type': 'security_rule',
-                    'title': 'Title II',
-                    'subsection': '45 CFR § 164.312',
-                    'description': 'Security Rule - Technical safeguards concern',
-                    'keywords': unique_matches,
-                    'weight': 3
-                })
-                total_weight += 3 * len(unique_matches)
+        # Check weak identifiers
+        for name, config in self.compiled_weak.items():
+            for pattern in config['compiled']:
+                matches = pattern.findall(text)
+                if matches:
+                    unique_matches = list(set(m if isinstance(m, str) else m[0] for m in matches[:3]))
+                    unique_matches = self._filter_false_positives(unique_matches, name)
+                    if unique_matches:
+                        identifier_reasons.append({
+                            'type': 'identifier',
+                            'subtype': name,
+                            'description': config['description'],
+                            'snippets': unique_matches,
+                            'score': config['score']
+                        })
+                        if identifier_score < 2:  # Don't downgrade from strong
+                            identifier_score = max(identifier_score, config['score'])
+                        weak_id_count += 1
         
-        # Determine status based on sensitivity and weight
-        status = self._determine_status(total_weight, violations, has_health_context)
+        # Multiple weak identifiers = stronger identification
+        if weak_id_count >= 3:
+            identifier_score = max(identifier_score, 2)
+        
+        # Combine reasons
+        reasons = health_reasons + identifier_reasons
+        
+        # Stage B: Classification
+        status = self._determine_status(
+            health_score=health_score,
+            identifier_score=identifier_score,
+            is_first_person=is_first_person,
+            is_deidentified=is_deidentified,
+            reasons=reasons
+        )
         
         scan_time = time.time() - start_time
         
         return {
             'status': status,
-            'violations': violations,
-            'scan_time': round(scan_time * 1000, 2),  # milliseconds
-            'has_health_context': has_health_context,
-            'total_weight': total_weight
+            'reasons': reasons,
+            'violations': self._format_violations(reasons, status),  # Backwards compatibility
+            'scores': {
+                'health_score': health_score,
+                'identifier_score': identifier_score
+            },
+            'is_first_person': is_first_person,
+            'is_deidentified': is_deidentified,
+            'scan_time': round(scan_time * 1000, 2)
         }
     
-    def _determine_status(self, weight: float, violations: List, has_health_context: bool) -> str:
+    def _is_first_person_context(self, text: str) -> bool:
         """
-        Determine the status color based on findings and sensitivity level.
+        Check if the text is primarily about the author themselves.
+        Returns True if text uses first-person pronouns without patient context.
         """
-        if not violations:
-            return 'green'
+        # Count first-person pronouns
+        first_person_count = sum(
+            len(p.findall(text)) for p in self.compiled_first_person
+        )
         
-        # Sensitivity thresholds
-        # Level 1 (Low): Very strict - only obvious violations are red
-        # Level 4 (High): Very sensitive - any potential issue is flagged
-        thresholds = {
-            1: {'orange': 8, 'red': 15},
-            2: {'orange': 5, 'red': 10},
-            3: {'orange': 3, 'red': 7},
-            4: {'orange': 1, 'red': 4},
+        # Check for explicit patient context (third-party)
+        patient_context = bool(re.search(
+            r'\b(?:my\s+patient|the\s+patient|patient\s+(?:named?|is|has)|his\s+(?:chart|record|diagnosis)|her\s+(?:chart|record|diagnosis)|their\s+(?:chart|record|diagnosis))\b',
+            text, re.IGNORECASE
+        ))
+        
+        # If lots of first-person and no patient context, it's about the author
+        if first_person_count >= 2 and not patient_context:
+            return True
+        
+        return False
+    
+    def _is_deidentified(self, text: str) -> bool:
+        """Check if text uses de-identified/generalized language."""
+        for pattern in self.compiled_deidentified:
+            if pattern.search(text):
+                return True
+        return False
+    
+    def _filter_false_positives(self, matches: List[str], identifier_type: str) -> List[str]:
+        """Filter out common false positives from matches."""
+        filtered = []
+        
+        # Common words that look like names but aren't
+        false_positive_names = {
+            'the', 'this', 'that', 'here', 'there', 'what', 'when', 'where', 'which',
+            'help', 'please', 'thank', 'thanks', 'hello', 'dear', 'best', 'regards',
+            'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+            'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august',
+            'september', 'october', 'november', 'december', 'new', 'york', 'los', 'angeles'
         }
         
-        thresh = thresholds.get(self.sensitivity, thresholds[3])
+        for match in matches:
+            match_lower = match.lower().strip() if isinstance(match, str) else str(match).lower()
+            
+            # Skip very short matches
+            if len(match_lower) < 2:
+                continue
+            
+            # Skip common false positives for names
+            if identifier_type in ['full_name', 'first_name_only']:
+                words = match_lower.split()
+                if any(w in false_positive_names for w in words):
+                    continue
+            
+            filtered.append(match)
         
-        # Automatic red for SSN regardless of sensitivity
-        if any(v['type'] == 'ssn' for v in violations):
-            return 'red'
+        return filtered
+    
+    def _determine_status(
+        self,
+        health_score: int,
+        identifier_score: int,
+        is_first_person: bool,
+        is_deidentified: bool,
+        reasons: List[Dict]
+    ) -> str:
+        """
+        Determine status based on scores and context.
         
-        # Check weight against thresholds
-        if weight >= thresh['red']:
-            return 'red'
-        elif weight >= thresh['orange']:
-            return 'orange'
-        else:
+        Decision rules:
+        - First-person context without patient references → GREEN
+        - De-identified/generalized language → GREEN
+        - No health context → GREEN (even with identifiers, just not PHI)
+        - Health context + strong identifier → RED
+        - Health context + weak identifier → ORANGE
+        - Health context alone (no identifier) → GREEN or ORANGE based on generalization
+        """
+        
+        # First-person exemption: if talking about yourself, not PHI
+        if is_first_person and identifier_score <= 1:
+            return 'green'
+        
+        # De-identified information is safe
+        if is_deidentified and identifier_score <= 1:
+            return 'green'
+        
+        # No health context = not PHI (just identifiers alone)
+        if health_score == 0:
+            if identifier_score >= 2:
+                # Strong identifier but no health info - just personal info, not PHI
+                # But we'll flag as caution since they might add health info
+                return 'orange' if self.sensitivity >= 3 else 'green'
+            return 'green'
+        
+        # Has health context - now check identifiers
+        if health_score >= 1:
+            # SSN with any health context = always RED
+            if any(r.get('subtype') == 'ssn' for r in reasons):
+                return 'red'
+            
+            # Strong identifier + health context = RED (PHI disclosure)
+            if identifier_score >= 2:
+                return 'red'
+            
+            # Weak identifier + health context = ORANGE (potential PHI)
+            if identifier_score == 1:
+                return 'orange'
+            
+            # Health context alone, no identifiers
+            # If explicit patient context without de-identification, be cautious
+            has_patient_context = any(
+                r.get('subtype') == 'patient_context' for r in reasons
+            )
+            if has_patient_context and self.sensitivity >= 3:
+                return 'orange'
+            
+            return 'green'
+        
+        return 'green'
+    
+    def _format_violations(self, reasons: List[Dict], status: str) -> List[Dict]:
+        """Format reasons into backwards-compatible violations format."""
+        violations = []
+        
+        for reason in reasons:
+            violations.append({
+                'type': reason.get('subtype', reason.get('type')),
+                'title': 'Title II',
+                'subsection': '45 CFR § 164.514',
+                'description': reason.get('description', ''),
+                'keywords': reason.get('snippets', []),
+                'category': reason.get('type')
+            })
+        
+        return violations
             # At high sensitivity, any violation is at least orange
             if self.sensitivity >= 3:
                 return 'orange'
@@ -538,10 +635,15 @@ async def health_check():
 @app.post("/api/scan", response_model=ScanResult)
 async def scan_text(request: ScanRequest):
     """
-    Scan text for HIPAA violations.
-    Returns status (green/orange/red) and detailed violation information.
+    Scan text for HIPAA Privacy Rule PHI disclosure.
+    
+    Returns:
+        - status: green (safe), orange (caution), red (likely PHI disclosure)
+        - violations: list of detected issues (backwards compatible)
+        - reasons: structured list of health/identifier findings
+        - scores: health_score and identifier_score for transparency
     """
-    # Update engine sensitivity if different
+    # Create engine with requested sensitivity
     engine = HIPAARulesEngine(request.sensitivity)
     result = engine.scan(request.text)
     
@@ -552,14 +654,16 @@ async def scan_text(request: ScanRequest):
     if request.platform:
         store.stats['violations_by_platform'][request.platform][result['status']] += 1
     
-    for violation in result['violations']:
-        store.stats['violations_by_title'][violation['title']] += 1
-        store.stats['violations_by_type'][violation['type']] += 1
+    for violation in result.get('violations', []):
+        store.stats['violations_by_title'][violation.get('title', 'Title II')] += 1
+        store.stats['violations_by_type'][violation.get('type', 'unknown')] += 1
     
     return ScanResult(
         status=result['status'],
-        violations=result['violations'],
-        scan_time=result['scan_time']
+        violations=result.get('violations', []),
+        scan_time=result['scan_time'],
+        scores=result.get('scores'),
+        reasons=result.get('reasons')
     )
 
 @app.post("/api/submit-event")
