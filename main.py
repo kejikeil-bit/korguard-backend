@@ -56,7 +56,10 @@ class SubmitEventRequest(BaseModel):
     text_length: int
 
 class SettingsUpdate(BaseModel):
-    sensitivity_level: int
+    sensitivity_level: Optional[int] = None
+    text_red_behavior: Optional[str] = None  # 'block', 'warn_with_override', 'log_only'
+    upload_red_behavior: Optional[str] = None  # 'block', 'warn_with_override', 'log_only'
+    pdf_red_behavior: Optional[str] = None  # Backwards compatibility alias
 
 class LoginRequest(BaseModel):
     username: str
@@ -72,6 +75,10 @@ class DataStore:
         
     def reset(self):
         self.sensitivity_level = 3
+        # Text message RED behavior: 'block', 'warn_with_override', 'log_only'
+        self.text_red_behavior = 'warn_with_override'
+        # File upload RED behavior: 'block', 'warn_with_override', 'log_only'
+        self.upload_red_behavior = 'warn_with_override'
         self.stats = {
             'total_scans': 0,
             'green_count': 0,
@@ -81,12 +88,21 @@ class DataStore:
             'violations_by_platform': defaultdict(lambda: {'green': 0, 'orange': 0, 'red': 0}),
             'violations_by_type': defaultdict(int),
             'overrides': {'orange': 0, 'red': 0},
-            'submit_times': []  # List of (status, time_seconds)
+            'submit_times': [],  # List of (status, time_seconds)
+            # File upload stats (PDFs, docs, images, etc.)
+            'file_scans': 0,
+            'file_green': 0,
+            'file_orange': 0,
+            'file_red': 0,
+            'file_blocked': 0,
+            'file_overrides': 0,
+            'file_by_type': defaultdict(lambda: {'scans': 0, 'green': 0, 'orange': 0, 'red': 0}),
         }
         self.sessions = {}  # session_token -> {username, expires}
         
     def get_stats_summary(self) -> Dict:
         total = self.stats['total_scans'] or 1  # Avoid division by zero
+        file_total = self.stats['file_scans'] or 1
         return {
             'total_scans': self.stats['total_scans'],
             'percentages': {
@@ -103,7 +119,35 @@ class DataStore:
             'by_platform': {k: dict(v) for k, v in self.stats['violations_by_platform'].items()},
             'by_type': dict(self.stats['violations_by_type']),
             'overrides': self.stats['overrides'],
-            'sensitivity_level': self.sensitivity_level
+            'sensitivity_level': self.sensitivity_level,
+            'text_red_behavior': self.text_red_behavior,
+            'upload_red_behavior': self.upload_red_behavior,
+            # Backwards compatibility
+            'pdf_red_behavior': self.upload_red_behavior,
+            # File upload stats (all file types)
+            'file_stats': {
+                'total': self.stats['file_scans'],
+                'green': self.stats['file_green'],
+                'orange': self.stats['file_orange'],
+                'red': self.stats['file_red'],
+                'blocked': self.stats['file_blocked'],
+                'overrides': self.stats['file_overrides'],
+                'by_type': {k: dict(v) for k, v in self.stats['file_by_type'].items()},
+                'percentages': {
+                    'green': round(self.stats['file_green'] / file_total * 100, 1),
+                    'orange': round(self.stats['file_orange'] / file_total * 100, 1),
+                    'red': round(self.stats['file_red'] / file_total * 100, 1),
+                }
+            },
+            # Backwards compatibility alias
+            'pdf_stats': {
+                'total': self.stats['file_scans'],
+                'green': self.stats['file_green'],
+                'orange': self.stats['file_orange'],
+                'red': self.stats['file_red'],
+                'blocked': self.stats['file_blocked'],
+                'overrides': self.stats['file_overrides'],
+            }
         }
 
 store = DataStore()
@@ -682,13 +726,88 @@ async def get_stats():
 @app.get("/api/settings")
 async def get_settings():
     """Get current settings."""
-    return {"sensitivity_level": store.sensitivity_level}
+    return {
+        "sensitivity_level": store.sensitivity_level,
+        "text_red_behavior": store.text_red_behavior,
+        "upload_red_behavior": store.upload_red_behavior,
+        "pdf_red_behavior": store.upload_red_behavior  # Backwards compatibility
+    }
 
 @app.post("/api/settings")
 async def update_settings(settings: SettingsUpdate):
     """Update settings."""
-    store.sensitivity_level = settings.sensitivity_level
-    return {"success": True, "sensitivity_level": store.sensitivity_level}
+    if settings.sensitivity_level is not None:
+        store.sensitivity_level = settings.sensitivity_level
+    # Text message behavior
+    if settings.text_red_behavior is not None:
+        if settings.text_red_behavior in ['block', 'warn_with_override', 'log_only']:
+            store.text_red_behavior = settings.text_red_behavior
+    # File upload behavior - accept either upload_red_behavior or pdf_red_behavior
+    behavior = settings.upload_red_behavior or settings.pdf_red_behavior
+    if behavior is not None:
+        if behavior in ['block', 'warn_with_override', 'log_only']:
+            store.upload_red_behavior = behavior
+    return {
+        "success": True,
+        "sensitivity_level": store.sensitivity_level,
+        "text_red_behavior": store.text_red_behavior,
+        "upload_red_behavior": store.upload_red_behavior,
+        "pdf_red_behavior": store.upload_red_behavior  # Backwards compatibility
+    }
+
+
+class FileScanEvent(BaseModel):
+    status: str  # green, orange, red
+    platform: str
+    outcome: str  # 'allowed', 'blocked', 'override', 'unscannable'
+    filename: Optional[str] = None  # Just filename, not content
+    file_type: Optional[str] = None  # 'pdf', 'txt', 'docx', 'image', etc.
+    text_length: Optional[int] = None
+
+
+@app.post("/api/file-event")
+async def log_file_event(event: FileScanEvent):
+    """
+    Log a file scan event for analytics.
+    Called by the extension after scanning any uploaded file.
+    """
+    # Update file stats
+    store.stats['file_scans'] += 1
+    
+    if event.status == 'green':
+        store.stats['file_green'] += 1
+    elif event.status == 'orange':
+        store.stats['file_orange'] += 1
+    elif event.status == 'red':
+        store.stats['file_red'] += 1
+        
+        if event.outcome == 'blocked':
+            store.stats['file_blocked'] += 1
+        elif event.outcome == 'override':
+            store.stats['file_overrides'] += 1
+    
+    # Track by file type
+    if event.file_type:
+        store.stats['file_by_type'][event.file_type]['scans'] += 1
+        store.stats['file_by_type'][event.file_type][event.status] += 1
+    
+    # Also track by platform
+    if event.platform:
+        store.stats['violations_by_platform'][event.platform][event.status] += 1
+    
+    return {"logged": True, "file_stats": {
+        "total": store.stats['file_scans'],
+        "blocked": store.stats['file_blocked'],
+        "overrides": store.stats['file_overrides']
+    }}
+
+
+# Backwards compatibility alias
+@app.post("/api/pdf-event")
+async def log_pdf_event_compat(event: FileScanEvent):
+    """Backwards compatibility alias for /api/file-event."""
+    event.file_type = event.file_type or 'pdf'
+    return await log_file_event(event)
 
 # ============================================================================
 # ADMIN AUTHENTICATION
@@ -1907,6 +2026,96 @@ ADMIN_DASHBOARD_HTML = """
             </div>
         </div>
         
+        <!-- File Upload Stats -->
+        <div class="charts-grid" style="margin-top: 32px;">
+            <div class="chart-card">
+                <h3 class="chart-title">📁 File Upload Scanning</h3>
+                <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">PDFs, documents, text files, and more</p>
+                <div class="stats-grid" style="grid-template-columns: repeat(2, 1fr); gap: 12px;">
+                    <div class="stat-card" style="padding: 16px;">
+                        <div class="stat-label">Files Scanned</div>
+                        <div class="stat-value" id="fileTotal" style="font-size: 24px;">0</div>
+                    </div>
+                    <div class="stat-card" style="padding: 16px;">
+                        <div class="stat-label">RED Files Blocked</div>
+                        <div class="stat-value red" id="fileBlocked" style="font-size: 24px;">0</div>
+                    </div>
+                </div>
+                <div style="display: flex; gap: 16px; margin-top: 16px;">
+                    <div style="flex: 1; text-align: center;">
+                        <div style="font-size: 20px; font-weight: 700; color: var(--green);" id="fileGreen">0</div>
+                        <div style="font-size: 11px; color: var(--text-muted);">Safe</div>
+                    </div>
+                    <div style="flex: 1; text-align: center;">
+                        <div style="font-size: 20px; font-weight: 700; color: var(--orange);" id="fileOrange">0</div>
+                        <div style="font-size: 11px; color: var(--text-muted);">Caution</div>
+                    </div>
+                    <div style="flex: 1; text-align: center;">
+                        <div style="font-size: 20px; font-weight: 700; color: var(--red);" id="fileRed">0</div>
+                        <div style="font-size: 11px; color: var(--text-muted);">PHI Detected</div>
+                    </div>
+                    <div style="flex: 1; text-align: center;">
+                        <div style="font-size: 20px; font-weight: 700; color: #f59e0b;" id="fileOverrides">0</div>
+                        <div style="font-size: 11px; color: var(--text-muted);">Overrides</div>
+                    </div>
+                </div>
+            </div>
+            <div class="chart-card">
+                <h3 class="chart-title">🔒 Upload RED Behavior</h3>
+                <p style="font-size: 13px; color: var(--text-muted); margin: 12px 0 16px;">
+                    Configure what happens when a user tries to upload ANY file containing high-confidence PHI.
+                </p>
+                <div class="sensitivity-levels" id="uploadBehaviorLevels" style="grid-template-columns: repeat(3, 1fr);">
+                    <button class="sensitivity-btn upload-behavior-btn" data-behavior="block">
+                        <div class="level">🚫</div>
+                        <div class="label">Block</div>
+                        <div class="desc" style="font-size: 10px;">Prevent upload entirely</div>
+                    </button>
+                    <button class="sensitivity-btn upload-behavior-btn active" data-behavior="warn_with_override">
+                        <div class="level">⚠️</div>
+                        <div class="label">Warn + Override</div>
+                        <div class="desc" style="font-size: 10px;">Show dialog, allow bypass</div>
+                    </button>
+                    <button class="sensitivity-btn upload-behavior-btn" data-behavior="log_only">
+                        <div class="level">📝</div>
+                        <div class="label">Log Only</div>
+                        <div class="desc" style="font-size: 10px;">Allow upload, log event</div>
+                    </button>
+                </div>
+                <p style="font-size: 11px; color: #64748b; margin-top: 16px; line-height: 1.5;" id="uploadBehaviorDesc">
+                    Current: Users will see a strong warning dialog but can choose to continue uploading.
+                </p>
+            </div>
+        </div>
+        
+        <!-- Text Message RED Behavior -->
+        <div class="settings-card">
+            <h3 class="settings-title">💬 Text Message RED Behavior</h3>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">
+                Configure what happens when a user tries to SEND a text message containing high-confidence PHI.
+            </p>
+            <div class="sensitivity-levels" id="textBehaviorLevels" style="grid-template-columns: repeat(3, 1fr);">
+                <button class="sensitivity-btn text-behavior-btn" data-behavior="block">
+                    <div class="level">🚫</div>
+                    <div class="label">Block</div>
+                    <div class="desc">Prevent sending entirely</div>
+                </button>
+                <button class="sensitivity-btn text-behavior-btn active" data-behavior="warn_with_override">
+                    <div class="level">⚠️</div>
+                    <div class="label">Warn + Override</div>
+                    <div class="desc">Show dialog, allow bypass</div>
+                </button>
+                <button class="sensitivity-btn text-behavior-btn" data-behavior="log_only">
+                    <div class="level">📝</div>
+                    <div class="label">Log Only</div>
+                    <div class="desc">Allow send, log event</div>
+                </button>
+            </div>
+            <p style="font-size: 11px; color: #64748b; margin-top: 16px; line-height: 1.5;" id="textBehaviorDesc">
+                Current: Users will see a strong warning dialog but can choose to continue sending.
+            </p>
+        </div>
+        
         <!-- Sensitivity Settings -->
         <div class="settings-card">
             <h3 class="settings-title">Detection Sensitivity</h3>
@@ -2025,6 +2234,20 @@ ADMIN_DASHBOARD_HTML = """
             });
         }
         
+        // Text message behavior descriptions
+        const TEXT_BEHAVIOR_DESCS = {
+            'block': 'Current: Messages containing PHI will be automatically blocked from sending.',
+            'warn_with_override': 'Current: Users will see a strong warning dialog but can choose to continue sending.',
+            'log_only': 'Current: Messages are allowed but PHI detection events are logged for review.'
+        };
+        
+        // Upload behavior descriptions
+        const UPLOAD_BEHAVIOR_DESCS = {
+            'block': 'Current: Files containing PHI will be automatically blocked from upload.',
+            'warn_with_override': 'Current: Users will see a strong warning dialog but can choose to continue uploading.',
+            'log_only': 'Current: Uploads are allowed but PHI detection events are logged for review.'
+        };
+        
         // Fetch and update stats
         async function fetchStats() {
             try {
@@ -2040,6 +2263,30 @@ ADMIN_DASHBOARD_HTML = """
                 // Update overrides
                 document.getElementById('orangeOverrides').textContent = data.overrides.orange;
                 document.getElementById('redOverrides').textContent = data.overrides.red;
+                
+                // Update file upload stats
+                if (data.file_stats) {
+                    document.getElementById('fileTotal').textContent = data.file_stats.total.toLocaleString();
+                    document.getElementById('fileGreen').textContent = data.file_stats.green.toLocaleString();
+                    document.getElementById('fileOrange').textContent = data.file_stats.orange.toLocaleString();
+                    document.getElementById('fileRed').textContent = data.file_stats.red.toLocaleString();
+                    document.getElementById('fileBlocked').textContent = data.file_stats.blocked.toLocaleString();
+                    document.getElementById('fileOverrides').textContent = data.file_stats.overrides.toLocaleString();
+                }
+                
+                // Update text behavior buttons
+                const currentTextBehavior = data.text_red_behavior || 'warn_with_override';
+                document.querySelectorAll('.text-behavior-btn').forEach(btn => {
+                    btn.classList.toggle('active', btn.dataset.behavior === currentTextBehavior);
+                });
+                document.getElementById('textBehaviorDesc').textContent = TEXT_BEHAVIOR_DESCS[currentTextBehavior];
+                
+                // Update upload behavior buttons
+                const currentBehavior = data.upload_red_behavior || data.pdf_red_behavior || 'warn_with_override';
+                document.querySelectorAll('.upload-behavior-btn').forEach(btn => {
+                    btn.classList.toggle('active', btn.dataset.behavior === currentBehavior);
+                });
+                document.getElementById('uploadBehaviorDesc').textContent = UPLOAD_BEHAVIOR_DESCS[currentBehavior];
                 
                 // Update charts
                 statusChart.data.datasets[0].data = [
@@ -2060,8 +2307,10 @@ ADMIN_DASHBOARD_HTML = """
                 
                 // Update sensitivity buttons
                 const currentLevel = data.sensitivity_level;
-                document.querySelectorAll('.sensitivity-btn').forEach(btn => {
-                    btn.classList.toggle('active', parseInt(btn.dataset.level) === currentLevel);
+                document.querySelectorAll('.sensitivity-btn:not(.pdf-behavior-btn)').forEach(btn => {
+                    if (btn.dataset.level) {
+                        btn.classList.toggle('active', parseInt(btn.dataset.level) === currentLevel);
+                    }
                 });
                 
             } catch (error) {
@@ -2070,7 +2319,8 @@ ADMIN_DASHBOARD_HTML = """
         }
         
         // Sensitivity button handlers
-        document.querySelectorAll('.sensitivity-btn').forEach(btn => {
+        document.querySelectorAll('.sensitivity-btn:not(.pdf-behavior-btn)').forEach(btn => {
+            if (!btn.dataset.level) return;
             btn.addEventListener('click', async () => {
                 const level = parseInt(btn.dataset.level);
                 try {
@@ -2080,11 +2330,55 @@ ADMIN_DASHBOARD_HTML = """
                         body: JSON.stringify({ sensitivity_level: level })
                     });
                     
-                    document.querySelectorAll('.sensitivity-btn').forEach(b => {
-                        b.classList.toggle('active', parseInt(b.dataset.level) === level);
+                    document.querySelectorAll('.sensitivity-btn:not(.pdf-behavior-btn)').forEach(b => {
+                        if (b.dataset.level) {
+                            b.classList.toggle('active', parseInt(b.dataset.level) === level);
+                        }
                     });
                 } catch (error) {
                     console.error('Failed to update settings:', error);
+                }
+            });
+        });
+        
+        // Text behavior button handlers
+        document.querySelectorAll('.text-behavior-btn').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const behavior = btn.dataset.behavior;
+                try {
+                    await fetch('/api/settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ text_red_behavior: behavior })
+                    });
+                    
+                    document.querySelectorAll('.text-behavior-btn').forEach(b => {
+                        b.classList.toggle('active', b.dataset.behavior === behavior);
+                    });
+                    document.getElementById('textBehaviorDesc').textContent = TEXT_BEHAVIOR_DESCS[behavior];
+                } catch (error) {
+                    console.error('Failed to update text behavior:', error);
+                }
+            });
+        });
+        
+        // Upload behavior button handlers
+        document.querySelectorAll('.upload-behavior-btn').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const behavior = btn.dataset.behavior;
+                try {
+                    await fetch('/api/settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ upload_red_behavior: behavior })
+                    });
+                    
+                    document.querySelectorAll('.upload-behavior-btn').forEach(b => {
+                        b.classList.toggle('active', b.dataset.behavior === behavior);
+                    });
+                    document.getElementById('uploadBehaviorDesc').textContent = UPLOAD_BEHAVIOR_DESCS[behavior];
+                } catch (error) {
+                    console.error('Failed to update upload behavior:', error);
                 }
             });
         });
