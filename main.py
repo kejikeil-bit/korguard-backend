@@ -186,8 +186,10 @@ class HIPAARulesEngine:
                 r'\b(?:Mr\.|Mrs\.|Ms\.|Dr\.|Prof\.)\s+[A-Z][a-z]+\s+[A-Z][a-z]+\b',
                 # Two capitalized words that look like first + last name
                 r'\b[A-Z][a-z]{2,15}\s+[A-Z][a-z]{2,15}\b',
-                # Patient named X
-                r'(?:patient|client|member)\s+(?:named?|is|:)\s*[A-Z][a-z]+\s+[A-Z][a-z]+',
+                # More flexible: "patient name is john smith", "patient named john smith", etc.
+                r'(?:patient|client|member)(?:\'s)?\s+(?:name\s+is|named?|is|:)\s*[A-Za-z]+\s+[A-Za-z]+',
+                # Natural language: "name is john smith", "named john smith"
+                r'\b(?:name\s+is|named)\s+[A-Za-z]+\s+[A-Za-z]+',
             ],
             'description': 'Full name (first + last)',
             'score': 2
@@ -218,10 +220,12 @@ class HIPAARulesEngine:
         },
         'full_dob': {
             'patterns': [
-                # Explicit DOB mention
-                r'\b(?:DOB|date\s*of\s*birth|born(?:\s*on)?)[:\s]+(?:\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\w+\s+\d{1,2},?\s+\d{4})\b',
+                # DOB with colon or "is": "DOB: 01/15/1990", "date of birth is October 27 2004"
+                r'\b(?:DOB|date\s*of\s*birth|born(?:\s*on)?)\s*(?:is|:)?\s*(?:\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\w+\s+\d{1,2},?\s+\d{4})\b',
                 # Full date with month name
                 r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b',
+                # Birth date natural language: "birthday is", "born on"
+                r'\b(?:birth\s*(?:date|day)\s*(?:is|:)?|born\s+(?:on\s+)?)\s*(?:\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\w+\s+\d{1,2},?\s+\d{4})',
             ],
             'description': 'Date of birth or full date',
             'score': 2
@@ -256,7 +260,10 @@ class HIPAARulesEngine:
         },
         'city_only': {
             'patterns': [
-                r'\b(?:in|from|at|lives?\s*in)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?),?\s+(?:[A-Z]{2}|[A-Za-z]+)\b',
+                # "lives in Wylie TX", "from Chicago, IL", "in New York NY"
+                r'\b(?:in|from|at|lives?\s*in)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?),?\s+(?:[A-Z]{2}|[A-Za-z]+)\b',
+                # "resident of Chicago", "resides in Dallas"
+                r'\b(?:resident\s+of|resides?\s+in)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)',
             ],
             'description': 'City/location only',
             'score': 1
