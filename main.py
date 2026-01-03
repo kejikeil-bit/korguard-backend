@@ -97,6 +97,13 @@ class DataStore:
             'file_blocked': 0,
             'file_overrides': 0,
             'file_by_type': defaultdict(lambda: {'scans': 0, 'green': 0, 'orange': 0, 'red': 0}),
+            # De-identification coaching stats
+            'coaching_shown': 0,
+            'coaching_used_safer': 0,
+            'coaching_kept_original': 0,
+            'coaching_undid': 0,
+            'coaching_by_status': {'orange': 0, 'red': 0},
+            'coaching_safer_used_by_status': {'orange': 0, 'red': 0},
         }
         self.sessions = {}  # session_token -> {username, expires}
         
@@ -147,6 +154,18 @@ class DataStore:
                 'red': self.stats['file_red'],
                 'blocked': self.stats['file_blocked'],
                 'overrides': self.stats['file_overrides'],
+            },
+            # De-identification coaching stats
+            'coaching_stats': {
+                'shown': self.stats['coaching_shown'],
+                'used_safer': self.stats['coaching_used_safer'],
+                'kept_original': self.stats['coaching_kept_original'],
+                'undid': self.stats['coaching_undid'],
+                'by_status': dict(self.stats['coaching_by_status']),
+                'safer_used_by_status': dict(self.stats['coaching_safer_used_by_status']),
+                'safer_adoption_rate': round(
+                    self.stats['coaching_used_safer'] / max(self.stats['coaching_shown'], 1) * 100, 1
+                )
             }
         }
 
@@ -815,6 +834,70 @@ async def log_pdf_event_compat(event: FileScanEvent):
     """Backwards compatibility alias for /api/file-event."""
     event.file_type = event.file_type or 'pdf'
     return await log_file_event(event)
+
+
+# ============================================================================
+# DE-IDENTIFICATION COACHING EVENTS
+# ============================================================================
+
+class CoachingEvent(BaseModel):
+    """Coaching event data - NO PHI stored, only metadata."""
+    action: str  # 'shown', 'used_safer_version', 'kept_original', 'undid_safer_version'
+    status: str  # 'orange' or 'red'
+    platform: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+@app.post("/api/coaching-event")
+async def log_coaching_event(event: CoachingEvent):
+    """
+    Log a de-identification coaching event.
+    Only logs metadata - no PHI content is stored.
+    
+    Actions:
+    - 'shown': Coaching suggestions were displayed to user
+    - 'used_safer_version': User chose to use the de-identified version
+    - 'kept_original': User chose to keep their original text
+    - 'undid_safer_version': User undid the safer version replacement
+    """
+    action = event.action
+    status = event.status
+    
+    # Track coaching shown
+    if action == 'shown':
+        store.stats['coaching_shown'] += 1
+        if status in store.stats['coaching_by_status']:
+            store.stats['coaching_by_status'][status] += 1
+    
+    # Track user chose safer version
+    elif action == 'used_safer_version':
+        store.stats['coaching_used_safer'] += 1
+        if status in store.stats['coaching_safer_used_by_status']:
+            store.stats['coaching_safer_used_by_status'][status] += 1
+    
+    # Track user kept original
+    elif action == 'kept_original':
+        store.stats['coaching_kept_original'] += 1
+    
+    # Track undo
+    elif action == 'undid_safer_version':
+        store.stats['coaching_undid'] += 1
+    
+    # Track by platform
+    if event.platform:
+        store.stats['violations_by_platform'][event.platform][status] += 0  # Don't double count
+    
+    return {
+        "logged": True,
+        "coaching_stats": {
+            "shown": store.stats['coaching_shown'],
+            "used_safer": store.stats['coaching_used_safer'],
+            "kept_original": store.stats['coaching_kept_original'],
+            "safer_adoption_rate": round(
+                store.stats['coaching_used_safer'] / max(store.stats['coaching_shown'], 1) * 100, 1
+            )
+        }
+    }
 
 # ============================================================================
 # ADMIN AUTHENTICATION
