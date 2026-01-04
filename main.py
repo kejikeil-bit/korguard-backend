@@ -65,6 +65,16 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
+class FeedbackRequest(BaseModel):
+    """User feedback for false positives/negatives"""
+    text: str
+    detected_status: str  # 'green', 'orange', 'red'
+    expected_status: str  # What user thinks it should be
+    feedback_type: str  # 'false_positive' or 'false_negative'
+    platform: Optional[str] = None
+    timestamp: Optional[str] = None
+    detected_reasons: Optional[List[Dict[str, Any]]] = None
+
 # ============================================================================
 # IN-MEMORY DATA STORE (Replace with database in production)
 # ============================================================================
@@ -106,6 +116,12 @@ class DataStore:
             'coaching_undid': 0,
             'coaching_by_status': {'orange': 0, 'red': 0},
             'coaching_safer_used_by_status': {'orange': 0, 'red': 0},
+            # Feedback for automated training
+            'feedback': {
+                'false_positives': [],  # List of {text, detected_status, expected_status, timestamp}
+                'false_negatives': [],  # List of {text, detected_status, expected_status, timestamp}
+                'total_feedback': 0
+            }
         }
         self.sessions = {}  # session_token -> {username, expires}
         
@@ -822,13 +838,42 @@ class HIPAARulesEngine:
         """Filter out common false positives from matches."""
         filtered = []
         
-        # Common words that look like names but aren't
+        # Expanded false positive lists
         false_positive_names = {
-            'the', 'this', 'that', 'here', 'there', 'what', 'when', 'where', 'which',
-            'help', 'please', 'thank', 'thanks', 'hello', 'dear', 'best', 'regards',
+            # Common words
+            'the', 'this', 'that', 'here', 'there', 'what', 'when', 'where', 'which', 'who', 'why', 'how',
+            'help', 'please', 'thank', 'thanks', 'hello', 'dear', 'best', 'regards', 'sincerely',
+            # Days
             'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+            # Months
             'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august',
-            'september', 'october', 'november', 'december', 'new', 'york', 'los', 'angeles'
+            'september', 'october', 'november', 'december',
+            # Common phrases/words that trigger false positives
+            'simple', 'terms', 'explain', 'describe', 'tell', 'show', 'give', 'provide', 'create', 'make',
+            'write', 'draft', 'generate', 'summarize', 'outline', 'list', 'detail', 'clarify',
+            # Common adjectives/adverbs
+            'better', 'best', 'good', 'great', 'nice', 'fine', 'well', 'very', 'really', 'quite',
+            'more', 'most', 'less', 'least', 'some', 'many', 'much', 'few', 'little',
+            # Common verbs
+            'can', 'could', 'should', 'would', 'will', 'shall', 'may', 'might', 'must',
+            'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had',
+            'do', 'does', 'did', 'done', 'get', 'got', 'give', 'gave', 'take', 'took',
+            # Common nouns
+            'way', 'thing', 'part', 'time', 'day', 'year', 'month', 'week', 'hour', 'minute',
+            'person', 'people', 'man', 'woman', 'child', 'children', 'group', 'team',
+            # Common prepositions/conjunctions
+            'and', 'or', 'but', 'if', 'then', 'else', 'for', 'with', 'from', 'into', 'onto',
+            'about', 'above', 'across', 'after', 'against', 'along', 'among', 'around', 'at',
+            'before', 'behind', 'below', 'beneath', 'beside', 'between', 'beyond', 'by',
+            'during', 'except', 'inside', 'near', 'off', 'on', 'over', 'through', 'to', 'under', 'until',
+            # Locations
+            'new', 'york', 'los', 'angeles', 'san', 'francisco', 'chicago', 'houston'
+        }
+        
+        false_positive_locations = {
+            'local', 'area', 'region', 'place', 'location', 'spot', 'site', 'venue', 'space',
+            'simple', 'terms', 'way', 'thing', 'part', 'time', 'day', 'year', 'month',
+            'here', 'there', 'where', 'everywhere', 'somewhere', 'anywhere', 'nowhere'
         }
         
         for match in matches:
@@ -838,10 +883,41 @@ class HIPAARulesEngine:
             if len(match_lower) < 2:
                 continue
             
-            # Skip common false positives for names
-            if identifier_type in ['full_name', 'first_name_only']:
+            # Filter by identifier type
+            if identifier_type in ('full_name', 'first_name_only'):
                 words = match_lower.split()
+                
+                # Check if any word is a known false positive
                 if any(w in false_positive_names for w in words):
+                    continue
+                
+                # Names should be at least 2 characters per word
+                if any(len(w) < 2 for w in words):
+                    continue
+                
+                # Names shouldn't be common phrases
+                common_phrases = ['simple terms', 'in simple', 'explain in', 'tell me', 'help me']
+                if any(phrase in match_lower for phrase in common_phrases):
+                    continue
+                
+                # If it's a single word and it's a common word, reject
+                if len(words) == 1 and words[0] in false_positive_names:
+                    continue
+            
+            if identifier_type == 'city_only':
+                words = match_lower.split()
+                
+                # Check if any word is a known false positive location
+                if any(w in false_positive_locations for w in words):
+                    continue
+                
+                # Single word locations that are common words should be rejected
+                if len(words) == 1 and words[0] in false_positive_locations:
+                    continue
+                
+                # Common phrases that trigger false positives
+                common_location_phrases = ['in simple', 'simple terms', 'local area', 'in terms']
+                if any(phrase in match_lower for phrase in common_location_phrases):
                     continue
             
             filtered.append(match)
@@ -1319,6 +1395,59 @@ async def log_coaching_event(event: CoachingEvent):
                 store.stats['coaching_used_safer'] / max(store.stats['coaching_shown'], 1) * 100, 1
             )
         }
+    }
+
+@app.post("/api/feedback")
+async def submit_feedback(feedback: FeedbackRequest):
+    """
+    Submit user feedback for false positives/negatives.
+    Used for automated training and pattern improvement.
+    """
+    if not feedback.timestamp:
+        feedback.timestamp = datetime.utcnow().isoformat()
+    
+    feedback_entry = {
+        'text': feedback.text[:500],  # Truncate for storage
+        'detected_status': feedback.detected_status,
+        'expected_status': feedback.expected_status,
+        'feedback_type': feedback.feedback_type,
+        'platform': feedback.platform or 'unknown',
+        'timestamp': feedback.timestamp,
+        'detected_reasons': feedback.detected_reasons or []
+    }
+    
+    if feedback.feedback_type == 'false_positive':
+        store.stats['feedback']['false_positives'].append(feedback_entry)
+    elif feedback.feedback_type == 'false_negative':
+        store.stats['feedback']['false_negatives'].append(feedback_entry)
+    
+    store.stats['feedback']['total_feedback'] += 1
+    
+    # Keep only last 1000 feedback entries per type
+    if len(store.stats['feedback']['false_positives']) > 1000:
+        store.stats['feedback']['false_positives'] = store.stats['feedback']['false_positives'][-1000:]
+    if len(store.stats['feedback']['false_negatives']) > 1000:
+        store.stats['feedback']['false_negatives'] = store.stats['feedback']['false_negatives'][-1000:]
+    
+    return {
+        "logged": True,
+        "message": "Feedback received. Thank you for helping improve detection accuracy!",
+        "total_feedback": store.stats['feedback']['total_feedback']
+    }
+
+@app.get("/api/feedback/stats")
+async def get_feedback_stats(request: Request):
+    """Get feedback statistics (admin only)"""
+    username = verify_session(request)
+    if not username:
+        raise HTTPException(status_code=401, detail="Admin authentication required")
+    
+    return {
+        "total_feedback": store.stats['feedback']['total_feedback'],
+        "false_positives_count": len(store.stats['feedback']['false_positives']),
+        "false_negatives_count": len(store.stats['feedback']['false_negatives']),
+        "recent_false_positives": store.stats['feedback']['false_positives'][-10:],
+        "recent_false_negatives": store.stats['feedback']['false_negatives'][-10:]
     }
 
 # ============================================================================
