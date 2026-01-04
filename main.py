@@ -1,5 +1,5 @@
 """
-Korgaurd Beacon - FastAPI Backend
+Korguard Beacon - FastAPI Backend
 HIPAA Compliance Scanning API and Admin Dashboard
 """
 
@@ -19,7 +19,7 @@ import secrets
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="Korgaurd Beacon API",
+    title="Korguard Beacon API",
     description="HIPAA Compliance Scanning API for LLM Chat Interfaces",
     version="1.0.0"
 )
@@ -1617,7 +1617,7 @@ LANDING_PAGE_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Korgaurd Beacon - AI Input Compliance Scanner</title>
+    <title>Korguard Beacon - AI Input Compliance Scanner</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -2107,7 +2107,7 @@ LANDING_PAGE_HTML = """
                         <path d="M12 2L4 5v6c0 5.55 3.84 10.74 8 12 4.16-1.26 8-6.45 8-12V5l-8-3z"/>
                     </svg>
                 </div>
-                <span class="logo-text">Korgaurd <span>Beacon</span></span>
+                <span class="logo-text">Korguard <span>Beacon</span></span>
             </div>
             <div class="divider"></div>
             <span class="beacon-logo">Beacon Health System</span>
@@ -2128,7 +2128,7 @@ LANDING_PAGE_HTML = """
             </h1>
             
             <p class="subtitle">
-                Korgaurd Beacon scans your AI prompts in real-time for HIPAA-sensitive 
+                Korguard Beacon scans your AI prompts in real-time for HIPAA-sensitive 
                 information, warning you before protected health information is shared 
                 with LLM services.
             </p>
@@ -2208,7 +2208,7 @@ LANDING_PAGE_HTML = """
     </section>
     
     <footer>
-        <p>© 2024 Korgaurd Beacon • Beacon Health System • HIPAA Compliance Tool</p>
+        <p>© 2024 Korguard Beacon • Beacon Health System • HIPAA Compliance Tool</p>
     </footer>
 </body>
 </html>
@@ -2220,7 +2220,7 @@ LOGIN_PAGE_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin Login - Korgaurd Beacon</title>
+    <title>Admin Login - Korguard Beacon</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -2377,7 +2377,7 @@ LOGIN_PAGE_HTML = """
                         <path d="M12 2L4 5v6c0 5.55 3.84 10.74 8 12 4.16-1.26 8-6.45 8-12V5l-8-3z"/>
                     </svg>
                 </div>
-                <span class="logo-text">Korgaurd <span>Beacon</span></span>
+                <span class="logo-text">Korguard <span>Beacon</span></span>
             </div>
             
             <h1>Admin Sign In</h1>
@@ -2419,7 +2419,7 @@ ADMIN_DASHBOARD_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin Dashboard - Korgaurd Beacon</title>
+    <title>Admin Dashboard - Korguard Beacon</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -2617,6 +2617,7 @@ ADMIN_DASHBOARD_HTML = """
             cursor: pointer;
             transition: all 0.2s;
             text-align: center;
+            color: var(--text);
         }
         
         .sensitivity-btn:hover {
@@ -2729,7 +2730,7 @@ ADMIN_DASHBOARD_HTML = """
                     <path d="M12 2L4 5v6c0 5.55 3.84 10.74 8 12 4.16-1.26 8-6.45 8-12V5l-8-3z"/>
                 </svg>
             </div>
-            <span class="logo-text">Korgaurd <span>Beacon</span></span>
+            <span class="logo-text">Korguard <span>Beacon</span></span>
         </div>
         <div class="header-right">
             <span class="user-info">Logged in as <strong>Admin</strong></span>
@@ -2919,10 +2920,10 @@ ADMIN_DASHBOARD_HTML = """
                 </div>
             </div>
             <div style="display: flex; gap: 10px;">
-                <button class="sensitivity-btn" id="viewRulesBtn" style="padding: 12px 24px; flex: none;">
+                <button class="sensitivity-btn" id="viewRulesBtn" style="padding: 12px 24px; flex: none; color: var(--text);">
                     👁️ View Current Rules
                 </button>
-                <button class="sensitivity-btn" id="refreshRulesBtn" style="padding: 12px 24px; flex: none; background: var(--dark-lighter);">
+                <button class="sensitivity-btn" id="refreshRulesBtn" style="padding: 12px 24px; flex: none; background: var(--dark-lighter); color: var(--text);">
                     🔄 Force Refresh to Extensions
                 </button>
             </div>
@@ -2930,6 +2931,57 @@ ADMIN_DASHBOARD_HTML = """
             <!-- Rules Details (hidden by default) -->
             <div id="rulesDetails" style="display: none; margin-top: 20px; background: var(--dark); border-radius: 8px; padding: 16px; max-height: 400px; overflow-y: auto;">
                 <pre id="rulesJson" style="font-family: monospace; font-size: 12px; white-space: pre-wrap;"></pre>
+            </div>
+        </div>
+        
+        <!-- Feedback Statistics -->
+        <div class="settings-card">
+            <h3 class="card-title">📊 Feedback Statistics</h3>
+            <p class="card-subtitle" style="color: var(--text-muted); margin-bottom: 20px;">
+                User-reported false positives and missed detections for improving accuracy.
+            </p>
+            <div class="stats-grid" style="grid-template-columns: repeat(3, 1fr); margin-bottom: 20px;">
+                <div class="stat-card">
+                    <div class="stat-label">Total Feedback</div>
+                    <div class="stat-value" id="totalFeedback">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">False Positives</div>
+                    <div class="stat-value orange" id="falsePositivesCount">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Missed Detections</div>
+                    <div class="stat-value red" id="falseNegativesCount">0</div>
+                </div>
+            </div>
+            
+            <!-- Recent Feedback Table -->
+            <div class="table-card" style="margin-top: 20px;">
+                <div class="table-header">
+                    <h3 class="table-title">Recent Feedback</h3>
+                    <button class="sensitivity-btn" id="refreshFeedbackBtn" style="padding: 8px 16px; flex: none; color: var(--text);">
+                        🔄 Refresh
+                    </button>
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Type</th>
+                            <th>Detected</th>
+                            <th>Expected</th>
+                            <th>Platform</th>
+                            <th>Time</th>
+                            <th>Text Preview</th>
+                        </tr>
+                    </thead>
+                    <tbody id="feedbackTableBody">
+                        <tr>
+                            <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 20px;">
+                                No feedback yet. Click Refresh to load.
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
             </div>
         </div>
         
@@ -3250,6 +3302,63 @@ ADMIN_DASHBOARD_HTML = """
                 btn.textContent = '🔄 Force Refresh to Extensions';
             }
         });
+        
+        // Load feedback statistics
+        async function loadFeedbackStats() {
+            try {
+                const response = await fetch('/api/feedback/stats');
+                if (!response.ok) throw new Error('Failed to fetch feedback');
+                const data = await response.json();
+                
+                // Update stats
+                document.getElementById('totalFeedback').textContent = data.total_feedback.toLocaleString();
+                document.getElementById('falsePositivesCount').textContent = data.false_positives_count.toLocaleString();
+                document.getElementById('falseNegativesCount').textContent = data.false_negatives_count.toLocaleString();
+                
+                // Update table
+                const tbody = document.getElementById('feedbackTableBody');
+                const allFeedback = [
+                    ...data.recent_false_positives.map(f => ({...f, type: 'False Positive'})),
+                    ...data.recent_false_negatives.map(f => ({...f, type: 'Missed Detection'}))
+                ].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)).slice(0, 20);
+                
+                if (allFeedback.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 20px;">No feedback received yet.</td></tr>';
+                } else {
+                    tbody.innerHTML = allFeedback.map(f => {
+                        const date = new Date(f.timestamp);
+                        const timeStr = date.toLocaleString();
+                        const textPreview = f.text.length > 50 ? f.text.substring(0, 50) + '...' : f.text;
+                        const typeClass = f.type === 'False Positive' ? 'orange' : 'red';
+                        return `
+                            <tr>
+                                <td><span class="badge ${typeClass}">${f.type}</span></td>
+                                <td><span class="badge ${f.detected_status}">${f.detected_status}</span></td>
+                                <td><span class="badge ${f.expected_status}">${f.expected_status}</span></td>
+                                <td style="font-size: 12px;">${f.platform || 'unknown'}</td>
+                                <td style="font-size: 12px; color: var(--text-muted);">${timeStr}</td>
+                                <td style="font-size: 11px; color: var(--text-muted); max-width: 200px; overflow: hidden; text-overflow: ellipsis;" title="${f.text.replace(/"/g, '&quot;')}">${textPreview}</td>
+                            </tr>
+                        `;
+                    }).join('');
+                }
+            } catch (error) {
+                console.error('Failed to load feedback:', error);
+                document.getElementById('feedbackTableBody').innerHTML = 
+                    '<tr><td colspan="6" style="text-align: center; color: var(--red); padding: 20px;">Error loading feedback data.</td></tr>';
+            }
+        }
+        
+        // Refresh feedback button
+        document.getElementById('refreshFeedbackBtn').addEventListener('click', () => {
+            loadFeedbackStats();
+        });
+        
+        // Load feedback on page load
+        loadFeedbackStats();
+        
+        // Auto-refresh feedback every 30 seconds
+        setInterval(loadFeedbackStats, 30000);
     </script>
 </body>
 </html>
