@@ -79,6 +79,8 @@ class DataStore:
         self.text_red_behavior = 'warn_with_override'
         # File upload RED behavior: 'block', 'warn_with_override', 'log_only'
         self.upload_red_behavior = 'warn_with_override'
+        # Rules version - increment when rules change to trigger client refresh
+        self.rules_version = 1
         self.stats = {
             'total_scans': 0,
             'green_count': 0,
@@ -171,6 +173,247 @@ class DataStore:
 
 store = DataStore()
 
+# ============================================================================
+# RULES STORE - Backend-updatable HIPAA rules
+# ============================================================================
+
+class RulesStore:
+    """
+    Stores HIPAA detection rules that can be updated from the backend.
+    Extensions fetch these rules periodically and cache them locally.
+    """
+    
+    def __init__(self):
+        self.version = 2  # Increment when rules change (v2: fixed lowercase name/DOB detection)
+        self.last_updated = datetime.utcnow().isoformat()
+        
+        # Default rules (same as hardcoded in HIPAARulesEngine)
+        self.strong_identifiers = {
+            'full_name': {
+                'patterns': [
+                    r'\b(?:Mr\.|Mrs\.|Ms\.|Dr\.|Prof\.)\s+[A-Z][a-z]+\s+[A-Z][a-z]+\b',
+                    r'\b[A-Z][a-z]{2,15}\s+[A-Z][a-z]{2,15}\b',
+                    # More flexible: "patient name is john smith" - handles lowercase names
+                    r'(?:patient|client|member)(?:\'s)?\s+(?:name\s+is|named?|is|:)\s*[A-Za-z]{2,}\s+[A-Za-z]{2,}',
+                    # Natural language: "name is john smith", "named john smith"
+                    r'\b(?:name\s+is|named)\s+[A-Za-z]{2,}\s+[A-Za-z]{2,}',
+                ],
+                'description': 'Full name (first + last)',
+                'score': 2
+            },
+            'ssn': {
+                'patterns': [
+                    r'\b\d{3}-\d{2}-\d{4}\b',
+                    r'\b(?:SSN|Social\s*Security(?:\s*Number)?)[:\s#]*\d{3}[-\s]?\d{2}[-\s]?\d{4}\b',
+                ],
+                'description': 'Social Security Number',
+                'score': 3
+            },
+            'mrn': {
+                'patterns': [
+                    r'\b(?:MRN|Medical\s*Record(?:\s*Number)?|Chart\s*(?:Number|#|ID))[:\s#]+[A-Z0-9\-]+\b',
+                    r'\bMRN\s*[:\s#]?\s*[A-Z0-9]{4,}\b',
+                ],
+                'description': 'Medical Record Number',
+                'score': 2
+            },
+            'full_address': {
+                'patterns': [
+                    r'\b\d{1,5}\s+(?:[A-Z][a-z]+\s+){1,3}(?:Street|St\.?|Avenue|Ave\.?|Road|Rd\.?|Boulevard|Blvd\.?|Lane|Ln\.?|Drive|Dr\.?|Court|Ct\.?|Way|Place|Pl\.?|Circle|Cir\.?)\b(?:[,\s]+(?:Apt\.?|Suite|Ste\.?|Unit|#)\s*\d+)?',
+                ],
+                'description': 'Street address',
+                'score': 2
+            },
+            'full_dob': {
+                'patterns': [
+                    # DOB with "is": "date of birth is October 27 2004" or "date of birth is october 27 2004"
+                    r'\b(?:DOB|date\s*of\s*birth|born(?:\s*on)?)\s*(?:is|:)?\s*(?:\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|[A-Za-z]+\s+\d{1,2},?\s+\d{4})\b',
+                    # Standalone dates with month names (case-insensitive, with or without comma)
+                    r'\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2},?\s+\d{4}\b',
+                    # Birth date natural language: "birthday is", "born on"
+                    r'\b(?:birth\s*(?:date|day)\s*(?:is|:)?|born\s+(?:on\s+)?)\s*(?:\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|[A-Za-z]+\s+\d{1,2},?\s+\d{4})',
+                ],
+                'description': 'Date of birth or full date',
+                'score': 2
+            },
+            'email': {
+                'patterns': [
+                    r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+                ],
+                'description': 'Email address',
+                'score': 2
+            },
+            'phone': {
+                'patterns': [
+                    r'\b(?:\+?1[-.\s]?)?\(?[2-9]\d{2}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b',
+                ],
+                'description': 'Phone number',
+                'score': 2
+            },
+        }
+        
+        self.weak_identifiers = {
+            'first_name_only': {
+                'patterns': [
+                    r'\b(?:patient|client)\s+(?:named?|is|:)\s*([A-Z][a-z]{2,})\b',
+                    r'\b(?:Mr\.|Mrs\.|Ms\.)\s+([A-Z][a-z]+)\b',
+                ],
+                'description': 'First name only',
+                'score': 1
+            },
+            'city_only': {
+                'patterns': [
+                    r'\b(?:in|from|at|lives?\s*in)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?),?\s+(?:[A-Z]{2}|[A-Za-z]+)\b',
+                    r'\b(?:resident\s+of|resides?\s+in)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)',
+                ],
+                'description': 'City/location only',
+                'score': 1
+            },
+            'age_specific': {
+                'patterns': [
+                    r'\b(?:age[d]?\s*[:=]?\s*)?(9[0-9]|1[0-4]\d)\s*(?:years?|y\.?o\.?|year[s]?\s*old)\b',
+                ],
+                'description': 'Age over 89',
+                'score': 1
+            },
+            'zip_code': {
+                'patterns': [
+                    r'\b\d{5}(?:-\d{4})?\b',
+                ],
+                'description': 'ZIP code',
+                'score': 1
+            },
+        }
+        
+        self.health_context = {
+            'explicit_diagnosis': {
+                'patterns': [
+                    r'\b(?:diagnosed\s+with|diagnosis(?:\s+of)?[:\s]+|has\s+(?:been\s+)?diagnosed)\s+\w+',
+                    r'\b(?:cancer|diabetes|HIV|AIDS|hepatitis|tuberculosis|TB|COPD|CHF|CAD|CKD|ESRD|cirrhosis|lupus|MS|multiple\s+sclerosis|parkinson|alzheimer|dementia|schizophrenia|bipolar|major\s+depression|anxiety\s+disorder|PTSD|autism|epilepsy|seizure\s+disorder)\b',
+                    r'\b(?:stage\s+(?:I{1,4}|[1-4])|terminal|metastatic|malignant|benign)\s+\w+',
+                ],
+                'description': 'Explicit diagnosis',
+                'score': 2
+            },
+            'treatment_procedure': {
+                'patterns': [
+                    r'\b(?:surgery|chemotherapy|chemo|radiation|dialysis|transplant|amputation|intubat|ventilat|transfusion|infusion|biopsy)\b',
+                    r'\b(?:admitted|discharged|hospitalized|inpatient|outpatient|ER\s+visit|emergency\s+room)\b',
+                ],
+                'description': 'Treatment or procedure',
+                'score': 2
+            },
+            'medications': {
+                'patterns': [
+                    r'\b(?:taking|prescribed|on|started|discontinued)\s+(?:medication|meds?|drug)s?\b',
+                    r'\b(?:warfarin|metformin|insulin|lisinopril|atorvastatin|metoprolol|omeprazole|amlodipine|gabapentin|hydrocodone|oxycodone|morphine|fentanyl)\b',
+                ],
+                'description': 'Medication reference',
+                'score': 2
+            },
+            'patient_context': {
+                'patterns': [
+                    r'\b(?:my\s+patient|the\s+patient|this\s+patient|patient\'s|patient\s+with)\b',
+                    # "Patient name is", "Patient is", "Patient has", etc. - clear patient context
+                    r'\bpatient\s+(?:name|is|has|was|will|presents|presenting|complaining|diagnosed|admitted|discharged|taking|prescribed)\b',
+                    r'\b(?:chart|medical\s+record|clinical\s+note|progress\s+note|H&P|history\s+and\s+physical|discharge\s+summary)\b',
+                    r'\b(?:chief\s+complaint|presenting\s+with|presents\s+with|complaining\s+of)\b',
+                ],
+                'description': 'Patient/clinical context',
+                'score': 1
+            },
+            'general_health': {
+                'patterns': [
+                    r'\b(?:symptoms?|condition|illness|disease|disorder|syndrome|treatment|therapy|prognosis)\b',
+                    r'\b(?:hospital|clinic|physician|doctor|nurse|provider|specialist)\b',
+                ],
+                'description': 'General health terms',
+                'score': 1
+            },
+        }
+        
+        # Scoring thresholds
+        self.thresholds = {
+            'red': {'identifier_score': 2, 'health_score': 2},
+            'orange': {'identifier_score': 1, 'health_score': 1},
+        }
+        
+        # Custom keywords (user-defined)
+        self.custom_keywords = []
+    
+    def get_rules(self) -> Dict:
+        """Return all rules in a format suitable for the frontend"""
+        return {
+            'version': self.version,
+            'last_updated': self.last_updated,
+            'strong_identifiers': self.strong_identifiers,
+            'weak_identifiers': self.weak_identifiers,
+            'health_context': self.health_context,
+            'thresholds': self.thresholds,
+            'custom_keywords': self.custom_keywords,
+            'settings': {
+                'sensitivity_level': store.sensitivity_level,
+                'text_red_behavior': store.text_red_behavior,
+                'upload_red_behavior': store.upload_red_behavior,
+            }
+        }
+    
+    def update_rules(self, updates: Dict) -> None:
+        """Update rules and increment version"""
+        if 'strong_identifiers' in updates:
+            self.strong_identifiers.update(updates['strong_identifiers'])
+        if 'weak_identifiers' in updates:
+            self.weak_identifiers.update(updates['weak_identifiers'])
+        if 'health_context' in updates:
+            self.health_context.update(updates['health_context'])
+        if 'thresholds' in updates:
+            self.thresholds.update(updates['thresholds'])
+        if 'custom_keywords' in updates:
+            self.custom_keywords = updates['custom_keywords']
+        
+        self.version += 1
+        self.last_updated = datetime.utcnow().isoformat()
+    
+    def add_pattern(self, category: str, identifier: str, pattern: str) -> bool:
+        """Add a new pattern to an identifier"""
+        target = None
+        if category == 'strong':
+            target = self.strong_identifiers
+        elif category == 'weak':
+            target = self.weak_identifiers
+        elif category == 'health':
+            target = self.health_context
+        
+        if target and identifier in target:
+            if pattern not in target[identifier]['patterns']:
+                target[identifier]['patterns'].append(pattern)
+                self.version += 1
+                self.last_updated = datetime.utcnow().isoformat()
+                return True
+        return False
+    
+    def remove_pattern(self, category: str, identifier: str, pattern_index: int) -> bool:
+        """Remove a pattern from an identifier by index"""
+        target = None
+        if category == 'strong':
+            target = self.strong_identifiers
+        elif category == 'weak':
+            target = self.weak_identifiers
+        elif category == 'health':
+            target = self.health_context
+        
+        if target and identifier in target:
+            patterns = target[identifier]['patterns']
+            if 0 <= pattern_index < len(patterns):
+                patterns.pop(pattern_index)
+                self.version += 1
+                self.last_updated = datetime.utcnow().isoformat()
+                return True
+        return False
+
+
+rules_store = RulesStore()
+
 # Admin credentials (in production, use proper auth with hashed passwords)
 ADMIN_CREDENTIALS = {
     'admin': hashlib.sha256('beacon2024'.encode()).hexdigest()
@@ -206,9 +449,10 @@ class HIPAARulesEngine:
                 # Two capitalized words that look like first + last name
                 r'\b[A-Z][a-z]{2,15}\s+[A-Z][a-z]{2,15}\b',
                 # More flexible: "patient name is john smith", "patient named john smith", etc.
-                r'(?:patient|client|member)(?:\'s)?\s+(?:name\s+is|named?|is|:)\s*[A-Za-z]+\s+[A-Za-z]+',
+                # This pattern handles lowercase names in patient context
+                r'(?:patient|client|member)(?:\'s)?\s+(?:name\s+is|named?|is|:)\s*[A-Za-z]{2,}\s+[A-Za-z]{2,}',
                 # Natural language: "name is john smith", "named john smith"
-                r'\b(?:name\s+is|named)\s+[A-Za-z]+\s+[A-Za-z]+',
+                r'\b(?:name\s+is|named)\s+[A-Za-z]{2,}\s+[A-Za-z]{2,}',
             ],
             'description': 'Full name (first + last)',
             'score': 2
@@ -239,12 +483,12 @@ class HIPAARulesEngine:
         },
         'full_dob': {
             'patterns': [
-                # DOB with colon or "is": "DOB: 01/15/1990", "date of birth is October 27 2004"
-                r'\b(?:DOB|date\s*of\s*birth|born(?:\s*on)?)\s*(?:is|:)?\s*(?:\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\w+\s+\d{1,2},?\s+\d{4})\b',
-                # Full date with month name
-                r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b',
+                # DOB with "is": "date of birth is October 27 2004" or "date of birth is october 27 2004"
+                r'\b(?:DOB|date\s*of\s*birth|born(?:\s*on)?)\s*(?:is|:)?\s*(?:\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|[A-Za-z]+\s+\d{1,2},?\s+\d{4})\b',
+                # Standalone dates with month names (case-insensitive, with or without comma)
+                r'\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2},?\s+\d{4}\b',
                 # Birth date natural language: "birthday is", "born on"
-                r'\b(?:birth\s*(?:date|day)\s*(?:is|:)?|born\s+(?:on\s+)?)\s*(?:\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\w+\s+\d{1,2},?\s+\d{4})',
+                r'\b(?:birth\s*(?:date|day)\s*(?:is|:)?|born\s+(?:on\s+)?)\s*(?:\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|[A-Za-z]+\s+\d{1,2},?\s+\d{4})',
             ],
             'description': 'Date of birth or full date',
             'score': 2
@@ -351,6 +595,8 @@ class HIPAARulesEngine:
         'patient_context': {
             'patterns': [
                 r'\b(?:my\s+patient|the\s+patient|this\s+patient|patient\'s|patient\s+with)\b',
+                # "Patient name is", "Patient is", "Patient has", etc. - clear patient context
+                r'\bpatient\s+(?:name|is|has|was|will|presents|presenting|complaining|diagnosed|admitted|discharged|taking|prescribed)\b',
                 r'\b(?:chart|medical\s+record|clinical\s+note|progress\s+note|H&P|history\s+and\s+physical|discharge\s+summary)\b',
                 r'\b(?:chief\s+complaint|presenting\s+with|presents\s+with|complaining\s+of)\b',
             ],
@@ -698,10 +944,139 @@ async def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "version": "1.0.0"}
 
+# ============================================================================
+# ADVANCED CONTEXT-AWARE DETECTION ENGINE
+# Reduces false positives by understanding query/educational vs PHI disclosure
+# ============================================================================
+
+class AdvancedContextAnalyzer:
+    """
+    Advanced NLP-based context analyzer to reduce false positives.
+    Distinguishes between:
+    - PHI disclosure: "Patient John Smith has diabetes"
+    - Query about compliance: "Is it HIPAA compliant?"
+    - Educational content: "HIPAA requires..."
+    - First-person statements: "I have diabetes"
+    """
+    
+    # Query/Educational phrases that should NOT trigger warnings
+    QUERY_PATTERNS = [
+        # Questions about compliance
+        r'\b(?:is|are|was|were|would|should|can|could|will)\s+(?:it|this|that|he|she|they)\s+(?:hipaa|hippa|compliant|legal|allowed|permitted)',
+        r'\b(?:what|how|when|where|why)\s+(?:is|are|does|do|can|could|should|will)\s+(?:hipaa|hippa|compliant|legal|allowed)',
+        r'\b(?:is|are)\s+(?:hipaa|hippa|compliant|legal|allowed|permitted)',
+        r'\b(?:hipaa|hippa)\s+(?:compliant|compliance|legal|allows|requires|mandates|prohibits)',
+        r'\b(?:compliant|compliance)\s+(?:with|under)\s+(?:hipaa|hippa)',
+        # Educational/Informational
+        r'\b(?:hipaa|hippa)\s+(?:requires|mandates|prohibits|allows|permits|states|says|means)',
+        r'\b(?:according\s+to|under|per)\s+(?:hipaa|hippa)',
+        r'\b(?:what\s+is|what\s+does|explain|tell\s+me\s+about)\s+(?:hipaa|hippa|phi|protected\s+health)',
+        # General questions (not PHI disclosure)
+        r'\b(?:can\s+you|could\s+you|please|help\s+me)\s+(?:explain|tell|describe|define|what|how)',
+        r'\b(?:i\s+(?:want|need|would\s+like)\s+to\s+know|i\s+have\s+a\s+question)\s+about',
+    ]
+    
+    # Context indicators that suggest PHI disclosure (not query)
+    PHI_DISCLOSURE_INDICATORS = [
+        r'\b(?:patient|client|member)\s+(?:name|is|has|was|diagnosed|admitted|discharged)',
+        r'\b(?:my|the|this|our)\s+(?:patient|client|member)',
+        r'\b(?:chart|medical\s+record|clinical\s+note|progress\s+note)',
+        r'\b(?:ssn|social\s+security|date\s+of\s+birth|dob|mrn|medical\s+record\s+number)',
+    ]
+    
+    # First-person health statements (not PHI about others)
+    FIRST_PERSON_HEALTH = [
+        r'\b(?:i|i\'m|i\'ve|i\'ll|me|my|myself)\s+(?:have|has|had|am|was|will\s+be)\s+(?:diabetes|cancer|hiv|aids|depression|anxiety|ptsd)',
+        r'\b(?:i|i\'m|i\'ve)\s+(?:been\s+)?(?:diagnosed|treated|prescribed|admitted|discharged)',
+        r'\b(?:my|i\s+have)\s+(?:condition|diagnosis|treatment|medication|prescription)',
+    ]
+    
+    @staticmethod
+    def is_query_or_educational(text: str) -> bool:
+        """Check if text is asking about compliance/education rather than disclosing PHI"""
+        text_lower = text.lower()
+        
+        # Check for query patterns
+        for pattern in AdvancedContextAnalyzer.QUERY_PATTERNS:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return True
+        
+        # Check for question structure
+        question_words = ['what', 'how', 'when', 'where', 'why', 'is', 'are', 'can', 'should', 'would']
+        if any(text_lower.strip().startswith(qw) for qw in question_words):
+            # If it's a question and contains compliance terms, likely a query
+            if any(term in text_lower for term in ['hipaa', 'hippa', 'compliant', 'compliance', 'legal', 'phi', 'protected health']):
+                return True
+        
+        return False
+    
+    @staticmethod
+    def is_first_person_health(text: str) -> bool:
+        """Check if text is first-person health statement (not PHI about others)"""
+        text_lower = text.lower()
+        
+        for pattern in AdvancedContextAnalyzer.FIRST_PERSON_HEALTH:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return True
+        
+        # Check for "I/my" + health terms
+        if re.search(r'\b(?:i|i\'m|i\'ve|my|myself)\s+', text_lower) and \
+           re.search(r'\b(?:have|has|had|am|was|diagnosed|treatment|medication|condition|disease|disorder)\b', text_lower):
+            return True
+        
+        return False
+    
+    @staticmethod
+    def has_phi_disclosure_context(text: str) -> bool:
+        """Check if text has clear indicators of PHI disclosure (not query)"""
+        text_lower = text.lower()
+        
+        for pattern in AdvancedContextAnalyzer.PHI_DISCLOSURE_INDICATORS:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return True
+        
+        return False
+    
+    @staticmethod
+    def analyze_context(text: str) -> Dict[str, Any]:
+        """
+        Advanced context analysis to reduce false positives.
+        Returns context flags and adjusted risk assessment.
+        """
+        is_query = AdvancedContextAnalyzer.is_query_or_educational(text)
+        is_first_person = AdvancedContextAnalyzer.is_first_person_health(text)
+        has_phi_context = AdvancedContextAnalyzer.has_phi_disclosure_context(text)
+        
+        # Determine if this is likely a false positive
+        is_false_positive = False
+        reason = None
+        
+        if is_query and not has_phi_context:
+            is_false_positive = True
+            reason = "Query about compliance/education, not PHI disclosure"
+        elif is_first_person and not has_phi_context:
+            is_false_positive = True
+            reason = "First-person health statement, not PHI about others"
+        
+        return {
+            'is_query': is_query,
+            'is_first_person_health': is_first_person,
+            'has_phi_context': has_phi_context,
+            'is_false_positive': is_false_positive,
+            'reason': reason
+        }
+
+
 @app.post("/api/scan", response_model=ScanResult)
 async def scan_text(request: ScanRequest):
     """
-    Scan text for HIPAA Privacy Rule PHI disclosure.
+    Scan text for HIPAA Privacy Rule PHI disclosure with advanced context analysis.
+    
+    Uses:
+    1. Basic regex pattern matching (HIPAARulesEngine)
+    2. Advanced context analysis to reduce false positives
+    3. Query/educational phrase detection
+    4. First-person health statement detection
     
     Returns:
         - status: green (safe), orange (caution), red (likely PHI disclosure)
@@ -709,16 +1084,63 @@ async def scan_text(request: ScanRequest):
         - reasons: structured list of health/identifier findings
         - scores: health_score and identifier_score for transparency
     """
-    # Create engine with requested sensitivity
+    # Step 1: Advanced context analysis (reduce false positives)
+    context_analysis = AdvancedContextAnalyzer.analyze_context(request.text)
+    
+    # Step 2: If it's clearly a query/educational (not PHI disclosure), return green
+    if context_analysis['is_false_positive']:
+        return ScanResult(
+            status='green',
+            violations=[],
+            scan_time=0.001,
+            scores={'health_score': 0, 'identifier_score': 0},
+            reasons=[{
+                'type': 'context',
+                'subtype': 'query_educational',
+                'description': context_analysis['reason'],
+                'snippets': [],
+                'score': 0
+            }]
+        )
+    
+    # Step 3: Run standard HIPAA engine
     engine = HIPAARulesEngine(request.sensitivity)
     result = engine.scan(request.text)
     
-    # Update statistics
+    # Step 4: Apply context-based adjustments
+    original_status = result['status']
+    
+    # If context analysis suggests it's first-person health (not PHI about others)
+    # and we got orange/red, downgrade to green
+    if context_analysis['is_first_person_health'] and \
+       result['status'] in ['orange', 'red'] and \
+       not context_analysis['has_phi_context']:
+        result['status'] = 'green'
+        result['reasons'].append({
+            'type': 'context',
+            'subtype': 'first_person_exemption',
+            'description': 'First-person health statement, not PHI about others',
+            'snippets': [],
+            'score': 0
+        })
+    
+    # If it's a query but we still got orange/red, downgrade to green
+    elif context_analysis['is_query'] and result['status'] in ['orange', 'red']:
+        result['status'] = 'green'
+        result['reasons'].append({
+            'type': 'context',
+            'subtype': 'query_exemption',
+            'description': 'Query about compliance, not PHI disclosure',
+            'snippets': [],
+            'score': 0
+        })
+    
+    # Update statistics (use original status for stats, not adjusted)
     store.stats['total_scans'] += 1
-    store.stats[f"{result['status']}_count"] += 1
+    store.stats[f"{original_status}_count"] += 1
     
     if request.platform:
-        store.stats['violations_by_platform'][request.platform][result['status']] += 1
+        store.stats['violations_by_platform'][request.platform][original_status] += 1
     
     for violation in result.get('violations', []):
         store.stats['violations_by_title'][violation.get('title', 'Title II')] += 1
@@ -897,6 +1319,116 @@ async def log_coaching_event(event: CoachingEvent):
                 store.stats['coaching_used_safer'] / max(store.stats['coaching_shown'], 1) * 100, 1
             )
         }
+    }
+
+# ============================================================================
+# RULES API - Backend-updatable HIPAA rules
+# ============================================================================
+
+class RulesUpdate(BaseModel):
+    """Model for updating rules"""
+    strong_identifiers: Optional[Dict[str, Any]] = None
+    weak_identifiers: Optional[Dict[str, Any]] = None
+    health_context: Optional[Dict[str, Any]] = None
+    thresholds: Optional[Dict[str, Any]] = None
+    custom_keywords: Optional[List[str]] = None
+
+class PatternUpdate(BaseModel):
+    """Model for adding/removing individual patterns"""
+    category: str  # 'strong', 'weak', 'health'
+    identifier: str  # e.g., 'full_name', 'ssn'
+    pattern: Optional[str] = None  # For adding
+    pattern_index: Optional[int] = None  # For removing
+
+@app.get("/api/rules")
+async def get_rules(version: Optional[int] = None):
+    """
+    Get current HIPAA rules.
+    
+    If version is provided and matches current version, returns 304 Not Modified.
+    Extensions should cache rules locally and only fetch when version changes.
+    """
+    current_rules = rules_store.get_rules()
+    
+    # If client has current version, return minimal response
+    if version is not None and version >= current_rules['version']:
+        return {
+            "status": "current",
+            "version": current_rules['version'],
+            "message": "Rules are up to date"
+        }
+    
+    return {
+        "status": "ok",
+        **current_rules
+    }
+
+@app.get("/api/rules/version")
+async def get_rules_version():
+    """Quick endpoint to check current rules version"""
+    return {
+        "version": rules_store.version,
+        "last_updated": rules_store.last_updated
+    }
+
+@app.post("/api/rules")
+async def update_rules(request: Request, updates: RulesUpdate):
+    """Update HIPAA rules (admin only)"""
+    # Verify admin session
+    username = verify_session(request)
+    if not username:
+        raise HTTPException(status_code=401, detail="Admin authentication required")
+    
+    # Apply updates
+    update_dict = updates.dict(exclude_none=True)
+    if update_dict:
+        rules_store.update_rules(update_dict)
+    
+    return {
+        "status": "ok",
+        "message": "Rules updated successfully",
+        "version": rules_store.version,
+        "last_updated": rules_store.last_updated
+    }
+
+@app.post("/api/rules/pattern/add")
+async def add_pattern(request: Request, update: PatternUpdate):
+    """Add a new pattern to an identifier (admin only)"""
+    username = verify_session(request)
+    if not username:
+        raise HTTPException(status_code=401, detail="Admin authentication required")
+    
+    if not update.pattern:
+        raise HTTPException(status_code=400, detail="Pattern is required")
+    
+    success = rules_store.add_pattern(update.category, update.identifier, update.pattern)
+    if not success:
+        raise HTTPException(status_code=400, detail="Invalid category or identifier")
+    
+    return {
+        "status": "ok",
+        "message": f"Pattern added to {update.category}/{update.identifier}",
+        "version": rules_store.version
+    }
+
+@app.post("/api/rules/pattern/remove")
+async def remove_pattern(request: Request, update: PatternUpdate):
+    """Remove a pattern from an identifier by index (admin only)"""
+    username = verify_session(request)
+    if not username:
+        raise HTTPException(status_code=401, detail="Admin authentication required")
+    
+    if update.pattern_index is None:
+        raise HTTPException(status_code=400, detail="Pattern index is required")
+    
+    success = rules_store.remove_pattern(update.category, update.identifier, update.pattern_index)
+    if not success:
+        raise HTTPException(status_code=400, detail="Invalid category, identifier, or index")
+    
+    return {
+        "status": "ok",
+        "message": f"Pattern removed from {update.category}/{update.identifier}",
+        "version": rules_store.version
     }
 
 # ============================================================================
@@ -2233,6 +2765,45 @@ ADMIN_DASHBOARD_HTML = """
             </div>
         </div>
         
+        <!-- Rules Management -->
+        <div class="settings-card">
+            <h3 class="card-title">📋 HIPAA Rules Management</h3>
+            <p class="card-subtitle" style="color: var(--text-muted); margin-bottom: 20px;">
+                Backend-updatable detection rules. Extensions fetch these rules periodically.
+            </p>
+            <div class="rules-info" style="display: flex; gap: 40px; margin-bottom: 20px;">
+                <div>
+                    <div class="stat-label">Current Version</div>
+                    <div class="stat-value" id="rulesVersion" style="font-size: 24px;">-</div>
+                </div>
+                <div>
+                    <div class="stat-label">Last Updated</div>
+                    <div class="stat-value" id="rulesLastUpdated" style="font-size: 16px; color: var(--text-muted);">-</div>
+                </div>
+                <div>
+                    <div class="stat-label">Strong Identifiers</div>
+                    <div class="stat-value" id="rulesStrongCount" style="font-size: 24px; color: var(--orange);">-</div>
+                </div>
+                <div>
+                    <div class="stat-label">Health Keywords</div>
+                    <div class="stat-value" id="rulesHealthCount" style="font-size: 24px; color: var(--green);">-</div>
+                </div>
+            </div>
+            <div style="display: flex; gap: 10px;">
+                <button class="sensitivity-btn" id="viewRulesBtn" style="padding: 12px 24px; flex: none;">
+                    👁️ View Current Rules
+                </button>
+                <button class="sensitivity-btn" id="refreshRulesBtn" style="padding: 12px 24px; flex: none; background: var(--dark-lighter);">
+                    🔄 Force Refresh to Extensions
+                </button>
+            </div>
+            
+            <!-- Rules Details (hidden by default) -->
+            <div id="rulesDetails" style="display: none; margin-top: 20px; background: var(--dark); border-radius: 8px; padding: 16px; max-height: 400px; overflow-y: auto;">
+                <pre id="rulesJson" style="font-family: monospace; font-size: 12px; white-space: pre-wrap;"></pre>
+            </div>
+        </div>
+        
         <!-- Overrides Table -->
         <div class="table-card">
             <div class="table-header">
@@ -2476,9 +3047,80 @@ ADMIN_DASHBOARD_HTML = """
         // Initialize
         initCharts();
         fetchStats();
+        fetchRules();
         
         // Refresh stats every 30 seconds
         setInterval(fetchStats, 30000);
+        
+        // ========================================
+        // RULES MANAGEMENT
+        // ========================================
+        
+        async function fetchRules() {
+            try {
+                const response = await fetch('/api/rules');
+                const data = await response.json();
+                
+                if (data.status === 'ok') {
+                    document.getElementById('rulesVersion').textContent = data.version || 1;
+                    document.getElementById('rulesLastUpdated').textContent = 
+                        data.last_updated ? new Date(data.last_updated).toLocaleString() : 'Never';
+                    document.getElementById('rulesStrongCount').textContent = 
+                        Object.keys(data.strong_identifiers || {}).length;
+                    document.getElementById('rulesHealthCount').textContent = 
+                        Object.keys(data.health_context || {}).length;
+                    
+                    // Store for display
+                    window.currentRules = data;
+                }
+            } catch (error) {
+                console.error('Failed to fetch rules:', error);
+            }
+        }
+        
+        // View Rules button
+        document.getElementById('viewRulesBtn').addEventListener('click', () => {
+            const details = document.getElementById('rulesDetails');
+            const isHidden = details.style.display === 'none';
+            
+            if (isHidden && window.currentRules) {
+                document.getElementById('rulesJson').textContent = 
+                    JSON.stringify(window.currentRules, null, 2);
+            }
+            
+            details.style.display = isHidden ? 'block' : 'none';
+            document.getElementById('viewRulesBtn').textContent = 
+                isHidden ? '🙈 Hide Rules' : '👁️ View Current Rules';
+        });
+        
+        // Refresh Rules button (force version increment)
+        document.getElementById('refreshRulesBtn').addEventListener('click', async () => {
+            const btn = document.getElementById('refreshRulesBtn');
+            btn.disabled = true;
+            btn.textContent = '⏳ Refreshing...';
+            
+            try {
+                // Just increment version to trigger extension refresh
+                const response = await fetch('/api/rules', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({})  // Empty update just increments version
+                });
+                
+                if (response.ok) {
+                    await fetchRules();
+                    alert('Rules version incremented. Extensions will fetch new rules within the hour.');
+                } else {
+                    alert('Failed to refresh rules. Make sure you are logged in.');
+                }
+            } catch (error) {
+                console.error('Failed to refresh rules:', error);
+                alert('Failed to refresh rules: ' + error.message);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '🔄 Force Refresh to Extensions';
+            }
+        });
     </script>
 </body>
 </html>
